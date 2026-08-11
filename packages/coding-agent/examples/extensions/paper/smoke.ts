@@ -1,12 +1,13 @@
 /**
  * Exercises the sandbox routing without an LLM: every operation pi's tools would perform, run
- * against real gVisor zones, plus the properties that make the routing worth having.
+ * against real zones, plus the properties that make the routing worth having.
  *
  *   ./pi-test.sh --help >/dev/null   # (sanity: sources load)
  *   node_modules/.bin/tsx --tsconfig tsconfig.json \
  *     packages/coding-agent/examples/extensions/paper/smoke.ts
  *
- * Needs Docker and gVisor registered as `runsc`.
+ * Needs Docker with gVisor registered as `runsc`, and Nix with flakes plus KVM. The first run
+ * builds the zone's VM, which takes a while; later runs are cached.
  */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -23,6 +24,7 @@ import {
 	createPaperWriteOps,
 	executePaperGrep,
 } from "./tools.ts";
+import { scaffoldZoneDir } from "./zone.ts";
 
 const rows: Array<[string, string, string]> = [];
 
@@ -44,7 +46,26 @@ async function makeProject(): Promise<string> {
 	await writeFile(path.join(root, "README.md"), "# smoke\n");
 	await writeFile(path.join(root, "logo.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff]));
 	await writeFile(path.join(root, "node_modules", "junk", "big.js"), "should never be staged\n");
+	// The zone builds from the project's own NixOS config, so the project needs one.
+	await scaffoldZoneDir(path.join(root, DEFAULT_CONFIG.zone.dir));
 	return root;
+}
+
+/** Run a command in the zone and collect everything it printed. */
+async function zoneRun(
+	session: PaperSession,
+	command: string,
+	root: string,
+	timeoutSeconds?: number,
+): Promise<{ exitCode: number; output: string }> {
+	let output = "";
+	const result = await createPaperBashOps(session).exec(command, root, {
+		onData: (chunk) => {
+			output += chunk.toString("utf8");
+		},
+		...(timeoutSeconds ? { timeout: timeoutSeconds } : {}),
+	});
+	return { exitCode: result.exitCode ?? -1, output: output.trim() };
 }
 
 async function run(): Promise<void> {
@@ -52,8 +73,16 @@ async function run(): Promise<void> {
 	let session: PaperSession | undefined;
 
 	try {
-		session = await openPaperSession(root, DEFAULT_CONFIG);
+		session = await openPaperSession(root, DEFAULT_CONFIG, "smoke");
 		const active = session;
+
+		// --- the zone split -----------------------------------------------------
+		const readStatus = active.read.status();
+		const writeStatus = active.write.status();
+		assert(readStatus.containerId !== null, "the read zone has a container");
+		assert(writeStatus.containerId !== null, "the write zone has a container");
+		assert(readStatus.containerId !== writeStatus.containerId, "read and write are distinct containers");
+		record("zones", "one container each", `read=${readStatus.kind}, write=${writeStatus.kind}`);
 
 		// --- read -------------------------------------------------------------
 		const readOps = createPaperReadOps(active);
@@ -83,6 +112,14 @@ async function run(): Promise<void> {
 		assert(onDisk.includes("41"), "the real file is untouched before approval");
 		record("write", "real file untouched", "yes");
 
+		// Content containing NUL survives only because the bytes travel on the container
+		// process's stdin — an argv element cannot hold one.
+		await writeOps.writeFile(path.join(root, "src/nul.bin"), "before\0after\n");
+		const nulBack = await readOps.readFile(path.join(root, "src/nul.bin"));
+		assert(nulBack.includes(0), "a NUL byte survived the write");
+		assert(nulBack.toString("utf8") === "before\0after\n", "the whole content round-tripped");
+		record("write", "NUL content round-trips", `${nulBack.length} bytes via stdin`);
+
 		// --- edit ---------------------------------------------------------------
 		const editOps = createPaperEditOps(active);
 		const forEdit = await editOps.readFile(path.join(root, "src/util.ts"));
@@ -101,49 +138,80 @@ async function run(): Promise<void> {
 		assert(grepText.includes("42"), "grep searched the staged tree, not the real one");
 		record("grep", "matched staged content", grepText.split("\n")[0] ?? "");
 
-		// --- bash ---------------------------------------------------------------
-		const bashOps = createPaperBashOps(active);
-		let output = "";
-		const cat = await bashOps.exec("cat src/app.ts", root, {
-			onData: (chunk) => {
-				output += chunk.toString("utf8");
-			},
-		});
-		assert(cat.exitCode === 0 && output.includes("42"), "bash sees the staged tree");
-		record("bash", "sees staged edit", output.trim());
+		// --- bash, in the zone ---------------------------------------------------
+		// The first of these builds and boots the VM, so it is much slower than the rest.
+		const cat = await zoneRun(active, "cat src/app.ts", root);
+		assert(cat.exitCode === 0 && cat.output.includes("42"), "bash sees the staged tree");
+		record("zone", "sees staged edit", cat.output);
 
-		let writeOutput = "";
-		const tryWrite = await bashOps.exec("echo nope > src/app.ts", root, {
-			onData: (chunk) => {
-				writeOutput += chunk.toString("utf8");
-			},
-		});
-		assert(tryWrite.exitCode !== 0, "bash cannot write to the staged tree");
-		assert(/read-only/i.test(writeOutput), `the mount refused the write, got: ${writeOutput.trim()}`);
-		record("bash", "writes rejected", `exit ${tryWrite.exitCode}, ${writeOutput.trim()}`);
+		const zoneStatus = active.zone?.status();
+		assert(zoneStatus !== undefined && zoneStatus.pid !== undefined, "the zone has a running VM");
+		record("zone", "vm", `cid ${zoneStatus?.cid}, pid ${zoneStatus?.pid}`);
 
-		let netOutput = "";
-		await bashOps.exec("getent hosts example.com || echo NO_DNS", root, {
-			onData: (chunk) => {
-				netOutput += chunk.toString("utf8");
-			},
-		});
-		assert(netOutput.includes("NO_DNS"), "bash has no network");
-		record("bash", "no network", "confirmed");
+		// Unlike the container it replaced, the zone is writable — and none of it escapes.
+		const wrote = await zoneRun(active, "echo 'from the zone' > src/app.ts && echo built > artifact.txt && ls", root);
+		assert(wrote.exitCode === 0, `bash can write in the zone, got: ${wrote.output}`);
+		record("zone", "writes accepted", wrote.output.split("\n").join(" "));
 
-		let envOutput = "";
+		const stillStaged = await active.read.readFile("src/app.ts");
+		assert(stillStaged.content.includes("42"), "the staged tree did not see the zone's write");
+		assert(
+			(await readFile(path.join(root, "src/app.ts"), "utf8")).includes("41"),
+			"the real file did not see the zone's write",
+		);
+		record("zone", "changes stay inside", "staged tree and real file both untouched");
+
+		// Persistence is the whole point of the change: this is a second, separate connection.
+		const persisted = await zoneRun(active, "cat artifact.txt; cat src/app.ts", root);
+		assert(persisted.output.includes("built"), "a file written by an earlier command is still there");
+		assert(persisted.output.includes("from the zone"), "an edit made by an earlier command is still there");
+		record("zone", "state survives between calls", persisted.output.split("\n").join(" "));
+
+		// The read-only posture is enforced by virtiofsd on the host, not by a guest mount
+		// option that the guest's own root could undo.
+		const breakOut = await zoneRun(
+			active,
+			"mount -o remount,rw /mnt/lower; echo pwned > /mnt/lower/pwned; echo done",
+			root,
+		);
+		const refusal = breakOut.output.split("\n").find((line) => /read-only/i.test(line));
+		assert(refusal !== undefined, `the share refused the write, got: ${breakOut.output}`);
+		assert(!(await lsOps.exists(path.join(root, "pwned"))), "nothing appeared in the staged tree");
+		record("zone", "read-only share holds", refusal?.replace(/^.*: /, "") ?? "");
+
+		const net = await zoneRun(active, "ip -o link | cut -d: -f2; getent hosts example.com || echo NO_DNS", root);
+		assert(net.output.includes("NO_DNS"), "the zone has no DNS");
+		assert(!/eth|ens|enp/.test(net.output), `the zone has no network interface, got: ${net.output}`);
+		record("zone", "no network", net.output.split("\n").join(" "));
+
 		process.env.PAPER_SMOKE_SECRET = "leaked";
-		await bashOps.exec("env | grep PAPER_SMOKE_SECRET || echo NO_SECRET", root, {
-			onData: (chunk) => {
-				envOutput += chunk.toString("utf8");
-			},
-		});
-		assert(envOutput.includes("NO_SECRET"), "host environment is not forwarded");
-		record("bash", "host env withheld", "confirmed");
+		const env = await zoneRun(active, "env | grep PAPER_SMOKE_SECRET || echo NO_SECRET", root);
+		assert(env.output.includes("NO_SECRET"), "host environment is not forwarded");
+		record("zone", "host env withheld", "confirmed");
+
+		// A staged edit made after boot has to reach the zone, or the agent would test the file
+		// it had just replaced.
+		await createPaperWriteOps(active).writeFile(path.join(root, "src/util.ts"), "export const fresh = 1;\n");
+		const refreshed = await zoneRun(active, "cat src/util.ts", root);
+		assert(refreshed.output.includes("fresh"), `the zone saw the new staged edit, got: ${refreshed.output}`);
+		record("zone", "picks up later staged edits", refreshed.output);
+
+		const timedOut = await zoneRun(active, "echo before; sleep 30", root, 3).then(
+			() => "no error",
+			(error: unknown) => (error instanceof Error ? error.message : String(error)),
+		);
+		assert(/^timeout:/.test(timedOut), `a slow command times out, got: ${timedOut}`);
+		record("zone", "timeout", timedOut);
+
+		const resolved = await active.zone?.resolvePackages(["hello", "definitely-not-a-package"]);
+		assert(resolved?.known.join() === "hello", "a real nixpkgs attribute resolves");
+		assert(resolved?.unknown.join() === "definitely-not-a-package", "a made-up one does not");
+		record("zone", "package names checked before install", `known=${resolved?.known}, unknown=${resolved?.unknown}`);
 
 		// --- approval -----------------------------------------------------------
 		const diffs = await active.write.diff();
-		assert(diffs.length === 2, `two files staged, got ${diffs.length}`);
+		// src/app.ts (modified), src/util.ts (modified), src/nul.bin (created).
+		assert(diffs.length === 3, `three files staged, got ${diffs.length}`);
 		record("approval", "diff", diffs.map((entry) => entry.path).join(", "));
 
 		const committed = await active.write.commit(["src/app.ts"]);

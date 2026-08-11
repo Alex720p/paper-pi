@@ -195,8 +195,15 @@ describe("openai-completions tool_choice", () => {
 		expect("strict" in (tool ?? {})).toBe(false);
 	});
 
-	it("maps groq qwen3 reasoning levels to default reasoning_effort", async () => {
-		const model = getModel("groq", "qwen/qwen3-32b")!;
+	it("maps model thinking levels to a mapped reasoning_effort", async () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = {
+			...baseModel,
+			api: "openai-completions",
+			reasoning: true,
+			thinkingLevelMap: { medium: "default" },
+			compat: { supportsReasoningEffort: true },
+		} as const;
 		let payload: unknown;
 
 		await streamSimple(
@@ -1403,7 +1410,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends max_tokens for OpenCode completions models", async () => {
-		const cases = [getModel("opencode-go", "kimi-k2.6")!, getModel("opencode", "grok-build-0.1")!] as const;
+		const cases = [getModel("opencode-go", "kimi-k2.6")!, getModel("opencode", "glm-5.2")!] as const;
 
 		for (const model of cases) {
 			let payload: unknown;

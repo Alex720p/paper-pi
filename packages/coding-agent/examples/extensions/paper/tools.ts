@@ -13,12 +13,12 @@ import {
 	truncateLine,
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { execOnce } from "paper-api";
 
 import { locate, outsideError, type PaperSession } from "./session.ts";
+import { GUEST_WORKSPACE } from "./zone.ts";
 
-/** Where the staged tree is mounted inside every sandboxed command. */
-export const SANDBOX_WORKSPACE = "/mnt/0";
+/** Where the workspace lives inside the execution zone. */
+export const SANDBOX_WORKSPACE = GUEST_WORKSPACE;
 
 const DEFAULT_GREP_LIMIT = 100;
 const MAX_WALK_ENTRIES = 20_000;
@@ -30,32 +30,32 @@ type TextToolResult<TDetails> = {
 
 // --- the shared read path ----------------------------------------------------
 
-async function readBytes(session: PaperSession, candidate: string): Promise<Buffer> {
+/**
+ * Which path to hand the read zone.
+ *
+ * A workspace path goes in relative, because the read zone mounts the scratchpad first and
+ * resolves a relative path against mount 0 — so the agent sees its own staged edits rather than
+ * the real file. A configured read path goes in absolute, and lands on whichever later mount
+ * contains it.
+ */
+function readTarget(session: PaperSession, candidate: string): string {
 	const located = locate(session, candidate);
-	if (located.where === "workspace") {
-		// The scratchpad, not the real file: the agent must see its own staged edits.
-		const result = await session.write.readFileBytes(located.relative);
-		return Buffer.from(result.data);
-	}
-	if (located.where === "read" && session.read) {
-		const result = await session.read.readFileBytes(located.path);
-		return Buffer.from(result.data);
-	}
+	if (located.where === "workspace") return located.relative;
+	if (located.where === "read") return located.path;
 	throw outsideError(candidate);
+}
+
+async function readBytes(session: PaperSession, candidate: string): Promise<Buffer> {
+	const result = await session.read.readFileBytes(readTarget(session, candidate));
+	return Buffer.from(result.data);
 }
 
 async function statOf(session: PaperSession, candidate: string): Promise<{ type: string; size: number }> {
-	const located = locate(session, candidate);
-	if (located.where === "workspace") return session.write.stat(located.relative);
-	if (located.where === "read" && session.read) return session.read.stat(located.path);
-	throw outsideError(candidate);
+	return session.read.stat(readTarget(session, candidate));
 }
 
 async function listOf(session: PaperSession, candidate: string): Promise<Array<{ name: string; type: string }>> {
-	const located = locate(session, candidate);
-	if (located.where === "workspace") return session.write.list(located.relative);
-	if (located.where === "read" && session.read) return session.read.list(located.path);
-	throw outsideError(candidate);
+	return session.read.list(readTarget(session, candidate));
 }
 
 function relativeInWorkspace(session: PaperSession, candidate: string): string {
@@ -92,11 +92,20 @@ export function createPaperReadOps(session: PaperSession): ReadOperations {
 	};
 }
 
+/**
+ * Stage a change, and tell the zone its lower layer moved.
+ *
+ * The zone's overlay treats the scratchpad as an immutable lower layer, so without this the next
+ * command would see the file as it was when the VM booted.
+ */
+async function stageWrite(session: PaperSession, filePath: string, content: string): Promise<void> {
+	await session.write.writeFile(relativeInWorkspace(session, filePath), content);
+	session.zone?.markLowerDirty();
+}
+
 export function createPaperWriteOps(session: PaperSession): WriteOperations {
 	return {
-		writeFile: async (filePath, content) => {
-			await session.write.writeFile(relativeInWorkspace(session, filePath), content);
-		},
+		writeFile: (filePath, content) => stageWrite(session, filePath, content),
 		// The scratchpad creates parent directories on write, so there is nothing to do here.
 		mkdir: async () => undefined,
 	};
@@ -105,9 +114,7 @@ export function createPaperWriteOps(session: PaperSession): WriteOperations {
 export function createPaperEditOps(session: PaperSession): EditOperations {
 	return {
 		readFile: (filePath) => readBytes(session, filePath),
-		writeFile: async (filePath, content) => {
-			await session.write.writeFile(relativeInWorkspace(session, filePath), content);
-		},
+		writeFile: (filePath, content) => stageWrite(session, filePath, content),
 		access: async (filePath) => {
 			await statOf(session, filePath);
 		},
@@ -164,7 +171,7 @@ async function walkWorkspace(
 		if (signal?.aborted) throw new Error("Operation aborted");
 		let entries: Array<{ name: string; type: string }>;
 		try {
-			entries = await session.write.list(dir);
+			entries = await session.read.list(dir);
 		} catch {
 			return true;
 		}
@@ -252,7 +259,7 @@ export async function executePaperGrep(
 	const contextLines = params.context && params.context > 0 ? params.context : 0;
 	const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_GREP_LIMIT);
 
-	const matches = await session.write.grep(params.pattern, {
+	const matches = await session.read.grep(params.pattern, {
 		path: searchRoot,
 		// pi treats the pattern as a regex unless `literal` is set. Note that the sandbox greps
 		// with POSIX ERE, not ripgrep's Rust regex, so exotic syntax may not carry across.
@@ -276,8 +283,9 @@ export async function executePaperGrep(
 			break;
 		}
 
-		// paper-api reports the host-side path, which for a write zone is inside the scratchpad.
-		const relativePath = path.relative(session.write.scratchDir, match.path);
+		// paper-api reports the host-side path, mapped back out of the mount it matched in —
+		// which for mount 0 is the resolved scratchpad root, not `scratchDir` as configured.
+		const relativePath = path.relative(session.scratchRoot, match.path);
 		if (params.glob && !matchesToolGlob(relativePath, params.glob)) continue;
 
 		const displayPath = rootIsDirectory ? relativePath : path.basename(relativePath);
@@ -290,7 +298,7 @@ export async function executePaperGrep(
 			let lines = fileLines.get(relativePath);
 			if (!lines) {
 				// One extra read per matched file, only when context was asked for.
-				const content = await session.write.readFile(relativePath);
+				const content = await session.read.readFile(relativePath);
 				lines = content.content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 				fileLines.set(relativePath, lines);
 			}
@@ -336,9 +344,17 @@ export async function executePaperGrep(
 
 // --- bash --------------------------------------------------------------------
 
+/** Where a host directory lands inside the zone. Paths outside the workspace have no guest
+ * equivalent, so they collapse onto the workspace root rather than escaping it. */
+function guestCwd(session: PaperSession, hostCwd: string): string {
+	const located = locate(session, hostCwd);
+	if (located.where !== "workspace" || located.relative === ".") return SANDBOX_WORKSPACE;
+	return path.posix.join(SANDBOX_WORKSPACE, located.relative.split(path.sep).join(path.posix.sep));
+}
+
 export function createPaperBashOps(session: PaperSession): BashOperations {
 	return {
-		exec: async (command, _cwd, options) => {
+		exec: async (command, cwd, options) => {
 			// Only explicitly named variables cross the boundary. The host environment of a
 			// coding agent holds provider API keys, and this is the one place running untrusted
 			// commands, so forwarding it wholesale would hand them straight over.
@@ -351,22 +367,31 @@ export function createPaperBashOps(session: PaperSession): BashOperations {
 			const timeoutMs =
 				options.timeout && options.timeout > 0 ? options.timeout * 1000 : session.config.bash.timeoutMs;
 
-			const result = await execOnce({
-				// execOnce takes an argv array; `sh -c` is the caller's choice, not a shell this
-				// library builds. The command still runs with no network and read-only mounts.
-				command: ["/bin/sh", "-c", command],
-				readPaths: [session.write.scratchDir, ...session.config.readPaths],
-				workingDir: SANDBOX_WORKSPACE,
+			const zone = await session.ensureZone();
+			let emitted = 0;
+			let truncated = false;
+			const maxBytes = session.config.bash.maxOutputBytes;
+
+			const result = await zone.exec(command, {
+				cwd: guestCwd(session, cwd),
 				env,
 				timeoutMs,
-				maxOutputBytes: session.config.bash.maxOutputBytes,
-				resources: session.config.resources,
 				signal: options.signal,
+				onData: (chunk) => {
+					// The zone streams, unlike the container it replaced, so the cap has to be
+					// applied as the bytes go past rather than to a finished buffer.
+					if (truncated) return;
+					const remaining = maxBytes - emitted;
+					if (chunk.length >= remaining) {
+						truncated = true;
+						if (remaining > 0) options.onData(chunk.subarray(0, remaining));
+						options.onData(Buffer.from(`\n[output truncated at ${maxBytes} bytes]\n`));
+						return;
+					}
+					emitted += chunk.length;
+					options.onData(chunk);
+				},
 			});
-
-			// execOnce resolves once, so output arrives in a single chunk rather than streaming.
-			if (result.stdout.length > 0) options.onData(Buffer.from(result.stdout));
-			if (result.stderr.length > 0) options.onData(Buffer.from(result.stderr));
 
 			if (result.aborted) throw new Error("aborted");
 			if (result.timedOut) throw new Error(`timeout:${Math.round(timeoutMs / 1000)}`);

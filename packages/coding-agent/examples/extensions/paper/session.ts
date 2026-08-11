@@ -1,28 +1,46 @@
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 
-import { closeAll, createReadZone, createWriteZone, type ReadZone, type WriteZone } from "paper-api";
+import { createReadZone, createWriteZone, type ReadZone, type WriteZone } from "paper-api";
 
 import type { PaperConfig } from "./config.ts";
+import { openZone, type ZoneVm } from "./zone.ts";
 
 /**
- * The zones backing one pi session.
+ * The zones backing one pi session: one container per capability, plus the VM.
  *
- * There is exactly one write zone, and its scratchpad is the single tree everything else agrees
- * on: `read`, `edit`, `grep`, `ls` and `find` see it directly, and `bash` gets it mounted
- * read-only into each throwaway exec container. Without that, the agent would edit a file and
- * then run a test against the version it had just replaced.
+ * Both containers bind-mount the same host scratchpad, with opposite postures — read-write for
+ * the zone that mutates it, read-only for the zone that inspects it — and the execution zone gets
+ * it a third time, read-only, as the lower layer of its overlay.
+ *
+ * The scratchpad, rather than the real tree, is what everything agrees on because approval is
+ * batched: the only prompt is at `agent_end`, so for the rest of a turn the staged tree is the
+ * only current view. Reading the real tree instead would hand the agent back the file it had just
+ * replaced, and run tests against code it had just changed.
  */
 export interface PaperSession {
 	cwd: string;
 	config: PaperConfig;
-	/** Staged edits live here. The real tree changes only through `write.commit()`. */
+	/** Every read: the staged tree at /mnt/0, `config.readPaths` at /mnt/1 onwards. */
+	read: ReadZone;
+	/** Every mutation, as allowlisted processes in its own container. `commit()` is host-side. */
 	write: WriteZone;
-	/** Present only when `readPaths` is configured; covers paths outside the working directory. */
-	read: ReadZone | null;
+	/**
+	 * `bash` and `!`. Built lazily by `ensureZone`, because a VM costs a `nix build` and a boot,
+	 * and plenty of sessions never run a command at all.
+	 */
+	zone: ZoneVm | undefined;
+	ensureZone(onLog?: (line: string) => void): Promise<ZoneVm>;
+	/**
+	 * Realpath of `write.scratchDir`. `createReadZone` resolves its mount host paths, and grep
+	 * matches come back relative to the resolved one, so comparing against the unresolved
+	 * `scratchDir` would silently fail wherever the temp prefix is a symlink (macOS `/tmp`).
+	 */
+	scratchRoot: string;
 	close(): Promise<void>;
 }
 
-export async function openPaperSession(cwd: string, config: PaperConfig): Promise<PaperSession> {
+export async function openPaperSession(cwd: string, config: PaperConfig, sessionId: string): Promise<PaperSession> {
 	const write = await createWriteZone({
 		root: cwd,
 		files: config.workspace.include,
@@ -34,20 +52,69 @@ export async function openPaperSession(cwd: string, config: PaperConfig): Promis
 		resources: config.resources,
 	});
 
-	const read =
-		config.readPaths.length > 0
-			? await createReadZone({ paths: config.readPaths, resources: config.resources })
-			: null;
+	// The scratchpad is always mount 0, so a workspace-relative path needs no mapping at the call
+	// sites: `toContainerPath` resolves a relative path against the first mount.
+	let read: ReadZone;
+	try {
+		read = await createReadZone({
+			paths: [write.scratchDir, ...config.readPaths],
+			resources: config.resources,
+		});
+	} catch (error) {
+		// The write zone is already up and has already copied the tree; without this its container
+		// and scratchpad outlive the failed session.
+		await write.close().catch(() => undefined);
+		throw error;
+	}
 
-	return {
+	let zone: ZoneVm | undefined;
+	let startingZone: Promise<ZoneVm> | undefined;
+
+	const session: PaperSession = {
 		cwd,
 		config,
-		write,
 		read,
+		write,
+		get zone() {
+			return zone;
+		},
+		async ensureZone(onLog) {
+			if (zone) return zone;
+			if (!config.zone.enabled) {
+				throw new Error(
+					`The execution zone is disabled ("zone": { "enabled": false } in .pi/paper.json), ` +
+						`so there is nowhere to run commands.`,
+				);
+			}
+			if (!startingZone) {
+				startingZone = openZone({
+					zoneDir: path.resolve(cwd, config.zone.dir),
+					// The staged tree, not the real one: `bash` has to see the edits the agent
+					// made this turn, and the real tree is deliberately mounted nowhere.
+					lowerSource: config.zone.lowerSource === "cwd" ? cwd : write.scratchDir,
+					sessionId,
+					config: config.zone,
+					...(onLog ? { onLog } : {}),
+				})
+					.then((created) => {
+						zone = created;
+						return created;
+					})
+					.finally(() => {
+						startingZone = undefined;
+					});
+			}
+			return startingZone;
+		},
+		scratchRoot: await realpath(write.scratchDir),
 		close: async () => {
-			await closeAll();
+			// Scoped, not `closeAll()`: that tore down every zone the process had registered,
+			// including an in-flight fetch_url network zone belonging to nobody here.
+			await Promise.allSettled([read.close(), write.close(), zone?.close() ?? Promise.resolve()]);
 		},
 	};
+
+	return session;
 }
 
 /** Where a host path lives, as far as this session is concerned. */

@@ -1,0 +1,16 @@
+[
+  "bashInteractive",
+  "coreutils",
+  "findutils",
+  "diffutils",
+  "gnugrep",
+  "gnused",
+  "gawk",
+  "gnutar",
+  "gzip",
+  "procps",
+  "which",
+  "less",
+  "git",
+  "ripgrep"
+]
