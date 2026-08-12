@@ -48,7 +48,14 @@ import {
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 
-import { createNetworkZone, createTranscript, nullTranscript, type Transcript } from "paper-api";
+import {
+	createNetworkZone,
+	createTranscript,
+	type ExecZone,
+	nullTranscript,
+	scaffoldZoneDir,
+	type Transcript,
+} from "paper-api";
 import { Type } from "typebox";
 
 import { loadPaperConfig, type PaperConfig } from "./config.ts";
@@ -63,7 +70,6 @@ import {
 	executePaperGrep,
 	SANDBOX_WORKSPACE,
 } from "./tools.ts";
-import { scaffoldZoneDir, type ZoneVm } from "./zone.ts";
 
 const SANDBOX_NOTE =
 	`Runs in the execution zone: a virtual machine with no network device, holding a copy-on-write ` +
@@ -162,7 +168,7 @@ export default function (pi: ExtensionAPI): void {
 	 * The VM, built on first use. It costs a `nix build` and a boot, and plenty of sessions never
 	 * run a command at all, so nothing here happens at startup.
 	 */
-	async function ensureZone(ctx?: ExtensionContext): Promise<ZoneVm> {
+	async function ensureZone(ctx?: ExtensionContext): Promise<ExecZone> {
 		const active = await ensureSession(ctx);
 		if (active.zone) return active.zone;
 		await ensureZoneDir(ctx);

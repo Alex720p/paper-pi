@@ -25,6 +25,10 @@ it is ephemeral for the whole session, not for one command.** An install, a buil
 `node_modules`, a server started in the background — all still there in the next command, and all
 gone when you quit.
 
+The VM itself belongs to [paper-api](../../../../../../paper-api), like the containers do: this
+extension calls `createExecZone`, and the supervision, the vsock protocol and the NixOS template
+live there. What is below describes what the zone gives you; `paper-api/README.md` describes how.
+
 ```
   staged tree (host dir)  ──virtiofs, --readonly──▶  /mnt/lower  ┐
                                                                  ├ overlayfs ─▶ /workspace
@@ -43,7 +47,7 @@ bash: /mnt/lower/f: Read-only file system
 
 Commands travel in over AF_VSOCK. There is no network interface in the guest, so this is the only
 channel; systemd socket-activates a small agent per connection, and output streams back as it is
-produced.
+produced — `bash` shows it as it arrives rather than when the command ends.
 
 ### Installing things
 
@@ -71,6 +75,13 @@ host, and it happens because you said yes.
 Needs Docker with gVisor registered as `runsc` (`sudo runsc install`), and Nix with flakes plus
 KVM (`/dev/kvm`, and your user in the `kvm` group).
 
+paper-api is a `file:` dependency and is consumed as its build output, so build it first — the
+zone's NixOS template ships in there too:
+
+```sh
+cd /path/to/paper-api && npm install && npm run build
+```
+
 ```sh
 cd packages/coding-agent/examples/extensions/paper
 npm install --ignore-scripts
@@ -82,9 +93,9 @@ pi -e /path/to/pi/packages/coding-agent/examples/extensions/paper
 ```
 
 The first `bash` call offers to create `.pi/zone/` in your project — `flake.nix`, `zone.nix`,
-`packages.json` and `agent.py`, copied from `zone-template/`. They are yours: commit them, edit
-`zone.nix` to change what the zone looks like. `/zone init` does it explicitly, `/zone` shows
-status, `/zone restart` throws the VM away and boots a fresh one.
+`packages.json` and `agent.py`, copied from the template paper-api ships. They are yours: commit
+them, edit `zone.nix` to change what the zone looks like. `/zone init` does it explicitly, `/zone`
+shows status, `/zone restart` throws the VM away and boots a fresh one.
 
 Check it end to end without an LLM. It exercises every operation against real zones, boots a real
 VM, and asserts the properties below:
@@ -177,14 +188,15 @@ These are real losses, not rough edges. They follow from the isolation model.
   "zone": {
     "enabled": true,
     "dir": ".pi/zone",                         // the zone's NixOS config, in your project
+    "lowerSource": "staged",                   // or "cwd", to see the real tree instead
+    "allowInstall": true,
+    // Everything below is passed to paper-api untouched; omit one to take its default.
     "vcpu": 4,
     "memMb": 4096,
     "upperSizeMb": 2048,                       // the tmpfs every change lands in
     "shareProto": "virtiofs",                  // or "9p"
     "workspaceMode": "overlay",                // or "copy"
-    "lowerSource": "staged",                   // or "cwd", to see the real tree instead
     "machine": "q35",                          // or "microvm", if your host boots it
-    "allowInstall": true,
     "preserveUpperOnRebuild": true,
     "maxPreserveBytes": 67108864
   },
@@ -215,7 +227,8 @@ false` to turn it off.
 - `index.ts` — extension wiring: tool registration, approval UI, `/paper`, `/zone`, transcript hooks
 - `session.ts` — zone lifecycle and host-path resolution
 - `tools.ts` — the `*Operations` implementations, plus grep and bash
-- `zone.ts` — the VM supervisor: build, boot, exec over vsock, install, teardown
-- `zone-template/` — the NixOS config copied into a project's `.pi/zone` on first use
 - `config.ts` — configuration loading and merging
 - `smoke.ts` — end-to-end check against real zones, no LLM required
+
+The sandboxes themselves are paper-api's: `createReadZone`, `createWriteZone`, `createNetworkZone`
+and `createExecZone`, plus `scaffoldZoneDir` for the NixOS template.

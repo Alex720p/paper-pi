@@ -13,6 +13,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { scaffoldZoneDir } from "paper-api";
+
 import { DEFAULT_CONFIG } from "./config.ts";
 import { openPaperSession, type PaperSession } from "./session.ts";
 import {
@@ -24,7 +26,6 @@ import {
 	createPaperWriteOps,
 	executePaperGrep,
 } from "./tools.ts";
-import { scaffoldZoneDir } from "./zone.ts";
 
 const rows: Array<[string, string, string]> = [];
 

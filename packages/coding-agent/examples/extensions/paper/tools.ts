@@ -14,8 +14,9 @@ import {
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 
+import { GUEST_WORKSPACE } from "paper-api";
+
 import { locate, outsideError, type PaperSession } from "./session.ts";
-import { GUEST_WORKSPACE } from "./zone.ts";
 
 /** Where the workspace lives inside the execution zone. */
 export const SANDBOX_WORKSPACE = GUEST_WORKSPACE;

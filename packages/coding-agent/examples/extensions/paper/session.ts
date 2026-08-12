@@ -1,10 +1,16 @@
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 
-import { createReadZone, createWriteZone, type ReadZone, type WriteZone } from "paper-api";
+import {
+	createExecZone,
+	createReadZone,
+	createWriteZone,
+	type ExecZone,
+	type ReadZone,
+	type WriteZone,
+} from "paper-api";
 
 import type { PaperConfig } from "./config.ts";
-import { openZone, type ZoneVm } from "./zone.ts";
 
 /**
  * The zones backing one pi session: one container per capability, plus the VM.
@@ -29,8 +35,8 @@ export interface PaperSession {
 	 * `bash` and `!`. Built lazily by `ensureZone`, because a VM costs a `nix build` and a boot,
 	 * and plenty of sessions never run a command at all.
 	 */
-	zone: ZoneVm | undefined;
-	ensureZone(onLog?: (line: string) => void): Promise<ZoneVm>;
+	zone: ExecZone | undefined;
+	ensureZone(onLog?: (line: string) => void): Promise<ExecZone>;
 	/**
 	 * Realpath of `write.scratchDir`. `createReadZone` resolves its mount host paths, and grep
 	 * matches come back relative to the resolved one, so comparing against the unresolved
@@ -67,8 +73,8 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 		throw error;
 	}
 
-	let zone: ZoneVm | undefined;
-	let startingZone: Promise<ZoneVm> | undefined;
+	let zone: ExecZone | undefined;
+	let startingZone: Promise<ExecZone> | undefined;
 
 	const session: PaperSession = {
 		cwd,
@@ -87,13 +93,16 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 				);
 			}
 			if (!startingZone) {
-				startingZone = openZone({
-					zoneDir: path.resolve(cwd, config.zone.dir),
+				// Everything but the four knobs this extension owns is a paper-api tuning value,
+				// passed straight through so the defaults live in one place.
+				const { enabled: _enabled, dir, lowerSource, allowInstall: _allowInstall, ...tuning } = config.zone;
+				startingZone = createExecZone({
+					zoneDir: path.resolve(cwd, dir),
 					// The staged tree, not the real one: `bash` has to see the edits the agent
 					// made this turn, and the real tree is deliberately mounted nowhere.
-					lowerSource: config.zone.lowerSource === "cwd" ? cwd : write.scratchDir,
+					lowerSource: lowerSource === "cwd" ? cwd : write.scratchDir,
 					sessionId,
-					config: config.zone,
+					...tuning,
 					...(onLog ? { onLog } : {}),
 				})
 					.then((created) => {
