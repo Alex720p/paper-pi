@@ -103,7 +103,11 @@ function mergeInto(base: Record<string, unknown>, overrides: Record<string, unkn
 	const result: Record<string, unknown> = { ...base };
 	for (const key of Object.keys(overrides)) {
 		const override = overrides[key];
-		if (override === undefined) continue;
+		// JSON has no `undefined`, so `null` is how a config file spells "leave this alone".
+		// Letting it through would put a value past every default that nothing downstream checks
+		// for: a null `maxOutputBytes` caps every command's output at zero bytes, a null `zone`
+		// throws on the first bash call.
+		if (override === undefined || override === null) continue;
 		const existing = base[key];
 		result[key] = isPlainObject(existing) && isPlainObject(override) ? mergeInto(existing, override) : override;
 	}

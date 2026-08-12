@@ -171,6 +171,9 @@ export default function (pi: ExtensionAPI): void {
 	async function ensureZone(ctx?: ExtensionContext): Promise<ExecZone> {
 		const active = await ensureSession(ctx);
 		if (active.zone) return active.zone;
+		// Ask the session first when the zone is off: it owns that error, and scaffolding four
+		// files into somebody's repo before refusing to run anything is the wrong order.
+		if (!(await ensureConfig()).zone.enabled) return active.ensureZone();
 		await ensureZoneDir(ctx);
 
 		const accent = (text: string) => ctx?.ui.theme.fg("accent", text) ?? text;
@@ -583,7 +586,7 @@ export default function (pi: ExtensionAPI): void {
 					ctx.ui.setStatus("paper", ctx.ui.theme.fg("accent", `paper: ${line.slice(0, 60)}`));
 				});
 				ctx.ui.setStatus("paper", ctx.ui.theme.fg("accent", `paper: zone up (cid ${zone.cid})`));
-				ctx.ui.notify("The zone restarted. Everything it held is gone.", "info");
+				ctx.ui.notify("The zone restarted. Running processes are gone; files it held were carried across.", "info");
 				return;
 			}
 

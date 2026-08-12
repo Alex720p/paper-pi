@@ -383,7 +383,9 @@ export function createPaperBashOps(session: PaperSession): BashOperations {
 					// applied as the bytes go past rather than to a finished buffer.
 					if (truncated) return;
 					const remaining = maxBytes - emitted;
-					if (chunk.length >= remaining) {
+					// Strictly greater: output that exactly fills the budget is complete, and
+					// telling the model bytes are missing when they are not costs it a retry.
+					if (chunk.length > remaining) {
 						truncated = true;
 						if (remaining > 0) options.onData(chunk.subarray(0, remaining));
 						options.onData(Buffer.from(`\n[output truncated at ${maxBytes} bytes]\n`));

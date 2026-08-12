@@ -43,6 +43,12 @@ export interface PaperSession {
 	 * `scratchDir` would silently fail wherever the temp prefix is a symlink (macOS `/tmp`).
 	 */
 	scratchRoot: string;
+	/**
+	 * `config.readPaths`, realpath'd. The read zone resolves its mount host paths, so a readPath
+	 * that goes through a symlink is reachable by neither spelling otherwise: the configured one
+	 * fails the zone's own check, and the resolved one looks like it was never configured.
+	 */
+	readRoots: string[];
 	close(): Promise<void>;
 }
 
@@ -97,13 +103,18 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 				// passed straight through so the defaults live in one place.
 				const { enabled: _enabled, dir, lowerSource, allowInstall: _allowInstall, ...tuning } = config.zone;
 				startingZone = createExecZone({
+					// Tuning goes first because it is whatever was left in an untyped JSON file:
+					// a `zoneDir`, `sessionId` or `onLog` typed into .pi/paper.json must not win
+					// over what this session computed. `onLog` is passed unconditionally for the
+					// same reason — the library calls it, so a string from a config file would
+					// throw mid-build.
+					...tuning,
 					zoneDir: path.resolve(cwd, dir),
 					// The staged tree, not the real one: `bash` has to see the edits the agent
 					// made this turn, and the real tree is deliberately mounted nowhere.
 					lowerSource: lowerSource === "cwd" ? cwd : write.scratchDir,
 					sessionId,
-					...tuning,
-					...(onLog ? { onLog } : {}),
+					onLog,
 				})
 					.then((created) => {
 						zone = created;
@@ -116,10 +127,25 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 			return startingZone;
 		},
 		scratchRoot: await realpath(write.scratchDir),
+		readRoots: await Promise.all(
+			config.readPaths.map(async (candidate) => {
+				const absolute = path.resolve(candidate);
+				// A readPath that does not exist yet is kept as configured rather than dropped:
+				// the read zone will reject it with its own message.
+				return realpath(absolute).catch(() => absolute);
+			}),
+		),
 		close: async () => {
 			// Scoped, not `closeAll()`: that tore down every zone the process had registered,
 			// including an in-flight fetch_url network zone belonging to nobody here.
-			await Promise.allSettled([read.close(), write.close(), zone?.close() ?? Promise.resolve()]);
+			//
+			// `startingZone` matters as much as `zone`: quitting while the first boot is still
+			// running (a cold `nix build` is minutes) left a qemu and a virtiofsd exporting the
+			// scratchpad for the rest of the process's life, because `zone` was still undefined.
+			const closingZone = zone
+				? zone.close()
+				: (startingZone?.then((created) => created.close()) ?? Promise.resolve());
+			await Promise.allSettled([read.close(), write.close(), closingZone]);
 		},
 	};
 
@@ -135,8 +161,8 @@ export function locate(session: PaperSession, candidate: string): Located {
 	if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
 		return { where: "workspace", relative: relative === "" ? "." : relative };
 	}
-	for (const readPath of session.config.readPaths) {
-		const fromRead = path.relative(path.resolve(readPath), absolute);
+	for (const readPath of session.readRoots) {
+		const fromRead = path.relative(readPath, absolute);
 		if (fromRead === "" || (!fromRead.startsWith("..") && !path.isAbsolute(fromRead))) {
 			return { where: "read", path: absolute };
 		}
