@@ -3,9 +3,11 @@ import path from "node:path";
 
 import {
 	createExecZone,
+	createNetworkZone,
 	createReadZone,
 	createWriteZone,
 	type ExecZone,
+	type NetworkZone,
 	type ReadZone,
 	type WriteZone,
 } from "paper-api";
@@ -13,11 +15,13 @@ import {
 import type { PaperConfig } from "./config.ts";
 
 /**
- * The zones backing one pi session: one container per capability, plus the VM.
+ * The zones backing one pi session: one container per capability, plus the VM. Every one of them
+ * lives as long as the session does — built on first use, torn down by `close()`.
  *
- * Both containers bind-mount the same host scratchpad, with opposite postures — read-write for
- * the zone that mutates it, read-only for the zone that inspects it — and the execution zone gets
- * it a third time, read-only, as the lower layer of its overlay.
+ * The two file containers bind-mount the same host scratchpad, with opposite postures —
+ * read-write for the zone that mutates it, read-only for the zone that inspects it — and the
+ * execution zone gets it a third time, read-only, as the lower layer of its overlay. The network
+ * container is the odd one out: it mounts nothing at all, which is what buys it connectivity.
  *
  * The scratchpad, rather than the real tree, is what everything agrees on because approval is
  * batched: the only prompt is at `agent_end`, so for the rest of a turn the staged tree is the
@@ -37,6 +41,12 @@ export interface PaperSession {
 	 */
 	zone: ExecZone | undefined;
 	ensureZone(onLog?: (line: string) => void): Promise<ExecZone>;
+	/**
+	 * `fetch_url`. Built lazily by `ensureNetZone`, like the VM: it is the one sandbox with
+	 * connectivity, and plenty of sessions never fetch anything at all.
+	 */
+	net: NetworkZone | undefined;
+	ensureNetZone(): Promise<NetworkZone>;
 	/**
 	 * Realpath of `write.scratchDir`. `createReadZone` resolves its mount host paths, and grep
 	 * matches come back relative to the resolved one, so comparing against the unresolved
@@ -81,6 +91,8 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 
 	let zone: ExecZone | undefined;
 	let startingZone: Promise<ExecZone> | undefined;
+	let net: NetworkZone | undefined;
+	let startingNet: Promise<NetworkZone> | undefined;
 
 	const session: PaperSession = {
 		cwd,
@@ -126,6 +138,32 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 			}
 			return startingZone;
 		},
+		get net() {
+			return net;
+		},
+		async ensureNetZone() {
+			// Only a ready handle is reusable. A zone closed out from under the session — the
+			// signal handler's `closeAll()`, an idle timeout somebody configures later — would
+			// otherwise be handed back to throw `ZoneClosedError` on every fetch for the rest of
+			// the session, when rebuilding it costs one container start.
+			if (net?.status().state === "ready") return net;
+			if (!startingNet) {
+				startingNet = createNetworkZone({
+					// wget only: the zone's own allowlist already bars interpreters, and this is
+					// the single binary `fetch_url` knows how to read the output of.
+					allowedBinaries: ["wget"],
+					resources: config.resources,
+				})
+					.then((created) => {
+						net = created;
+						return created;
+					})
+					.finally(() => {
+						startingNet = undefined;
+					});
+			}
+			return startingNet;
+		},
 		scratchRoot: await realpath(write.scratchDir),
 		readRoots: await Promise.all(
 			config.readPaths.map(async (candidate) => {
@@ -137,15 +175,17 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 		),
 		close: async () => {
 			// Scoped, not `closeAll()`: that tore down every zone the process had registered,
-			// including an in-flight fetch_url network zone belonging to nobody here.
+			// including any a host application had opened alongside this session.
 			//
-			// `startingZone` matters as much as `zone`: quitting while the first boot is still
-			// running (a cold `nix build` is minutes) left a qemu and a virtiofsd exporting the
-			// scratchpad for the rest of the process's life, because `zone` was still undefined.
+			// The in-flight cases matter as much as the settled ones: quitting while the VM's
+			// first boot is still running (a cold `nix build` is minutes) left a qemu and a
+			// virtiofsd exporting the scratchpad for the rest of the process's life, because
+			// `zone` was still undefined. A fetch racing the shutdown leaks the same way.
 			const closingZone = zone
 				? zone.close()
 				: (startingZone?.then((created) => created.close()) ?? Promise.resolve());
-			await Promise.allSettled([read.close(), write.close(), closingZone]);
+			const closingNet = net ? net.close() : (startingNet?.then((created) => created.close()) ?? Promise.resolve());
+			await Promise.allSettled([read.close(), write.close(), closingZone, closingNet]);
 		},
 	};
 

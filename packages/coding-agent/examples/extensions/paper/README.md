@@ -12,7 +12,7 @@ exactly one dangerous capability.
 | `write` `edit` | a second container with it mounted **read-write** | stage a change; the real file needs approval |
 | `bash`, `!` commands | **the zone**: a microvm.nix VM that lives as long as the session | run anything; no network; nothing escapes |
 | `zone_install` | a host-side `nix build` you approve | add packages to the zone |
-| `fetch_url` | a container with **zero** filesystem mounts | reach the network; nothing local to exfiltrate |
+| `fetch_url` | a container with **zero** filesystem mounts, alive as long as the session | reach the network; nothing local to exfiltrate |
 
 No single sandbox can both read and write, and the only one that runs arbitrary commands has
 neither a network device nor a way to reach the host.
@@ -126,7 +126,7 @@ a test against the version it had just replaced.
         │
         └── diff() ─▶ you approve ─▶ commit() ─▶ real files      (host-side)
 
-  fetch_url ─────────────────────▶ network zone, no mounts at all
+  fetch_url ─────────────────────▶ network zone, no mounts at all — session-long
 ```
 
 `seed`, `diff` and `commit` stay host-side because their other endpoint is the real tree, which is
@@ -146,6 +146,10 @@ These are real losses, not rough edges. They follow from the isolation model.
   tree, and only with approval.
 - **The zone has no network.** `npm install` and `git fetch` fail; `zone_install` and `fetch_url`
   are the two ways anything gets in, and both ask you first.
+- **Fetches share one container for the session.** `fetch_url` builds its network container on the
+  first fetch and keeps it until the session ends, so a later fetch sees whatever an earlier one
+  left in the container's `/tmp`. That container still mounts nothing and cannot reach the host, so
+  no local file is exposed either way — but one request is no longer isolated from the next.
 - **A zone costs a `nix build` and a boot.** The first command of the first session pays for the
   VM's closure — several minutes, mostly downloads — and roughly 20 seconds of boot after that.
   Later sessions reuse the nix store. Nothing is built until a command actually runs.

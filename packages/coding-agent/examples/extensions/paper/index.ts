@@ -9,7 +9,8 @@
  *                             change only on approval
  *   bash / !                  a microvm.nix VM that lives as long as the session: the staged
  *                             tree read-only under a tmpfs overlay, and no network device
- *   fetch_url                 a network container with no filesystem mounts at all
+ *   fetch_url                 a network container with no filesystem mounts at all, also alive
+ *                             for the session
  *
  * One sandbox per capability, so no single one both reads and writes, and the only one that runs
  * arbitrary commands cannot reach the network or the host filesystem.
@@ -48,14 +49,7 @@ import {
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 
-import {
-	createNetworkZone,
-	createTranscript,
-	type ExecZone,
-	nullTranscript,
-	scaffoldZoneDir,
-	type Transcript,
-} from "paper-api";
+import { createTranscript, type ExecZone, nullTranscript, scaffoldZoneDir, type Transcript } from "paper-api";
 import { Type } from "typebox";
 
 import { loadPaperConfig, type PaperConfig } from "./config.ts";
@@ -441,21 +435,22 @@ export default function (pi: ExtensionAPI): void {
 			parameters: Type.Object({
 				url: Type.String({ description: "The URL to fetch" }),
 			}),
-			async execute(_id, params, signal) {
-				// A fresh zone per fetch keeps the blast radius to a single request.
-				const net = await createNetworkZone({ allowedBinaries: ["wget"] });
-				try {
-					const result = await net.exec(["wget", "-q", "-O-", "--timeout=20", params.url], {
-						signal,
-					});
-					if (result.exitCode !== 0) {
-						throw new Error(result.stderr.trim() || `wget exited with code ${result.exitCode}`);
-					}
-					const text = result.truncated ? `${result.stdout}\n\n[output truncated]` : result.stdout;
-					return { content: [{ type: "text", text }], details: undefined };
-				} finally {
-					await net.close();
+			async execute(_id, params, signal, _onUpdate, ctx) {
+				// One zone for the session, like every other sandbox here: a container start per
+				// fetch bought little, since the zone mounts nothing either way, and the session
+				// owns the teardown rather than each call racing its own. The cost is that
+				// successive fetches share one container and its noexec /tmp, so one can leave
+				// something a later one sees.
+				const active = await ensureSession(ctx);
+				const net = await active.ensureNetZone();
+				const result = await net.exec(["wget", "-q", "-O-", "--timeout=20", params.url], {
+					signal,
+				});
+				if (result.exitCode !== 0) {
+					throw new Error(result.stderr.trim() || `wget exited with code ${result.exitCode}`);
 				}
+				const text = result.truncated ? `${result.stdout}\n\n[output truncated]` : result.stdout;
+				return { content: [{ type: "text", text }], details: undefined };
 			},
 		}),
 	);
