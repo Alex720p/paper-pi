@@ -287,7 +287,12 @@ node_modules/.bin/tsx --tsconfig tsconfig.json \
 | `--warmup <n>` | 3 | calls per tool excluded from the table; the first one measures zone startup |
 | `--reps <n>` | 20 | measured calls per tool per trial |
 | `--tools <a,b>` | all 7 | restrict the tool set |
+| `--fixture <n>` | 20 | files in `src/`, the tree `ls`, `grep` and `find` walk |
 | `--json <path>` | – | also write the summary and raw samples as JSON |
+
+`--fixture` exists because tree size is part of the result for the read-only tools. Sweeping it is
+how the `ls` behaviour below was characterised:
+`--tools ls --fixture 5,20,40` gives 220, 592 and 961 ms, i.e. about `114 ms + 21 ms x entries`.
 
 `--trials 1 --reps 5` is a fast check. Results print to stdout at the end; progress goes to stderr,
 so stdout can be redirected on its own. Needs paper's prerequisites: Docker with gVisor as `runsc`,
@@ -324,6 +329,21 @@ Expect roughly 10% run-to-run variation in the absolute means on an otherwise bu
 relative ordering and the slowdown factors are far more stable than the absolute figures. Quote
 numbers from a single run rather than mixing runs, and state the fixture size alongside `ls`,
 `grep` and `find`.
+
+#### Why `ls` is the outlier
+
+Under paper, `ls` costs roughly `114 ms + 21 ms x entries`, while every other tool is flat. It is
+the only tool whose backend call count scales with its output: `ls.ts` stats each entry separately,
+in a serial loop, purely to append `/` to directories. Locally each `stat` is `fs.stat` and costs
+microseconds; through a gVisor container each becomes a round trip, and the measured ~21 ms per
+entry matches the cost of a single sandboxed call. `grep` and `find` avoid this entirely by spawning
+`rg`/`fd` inside the container and letting it do the walking — one call, whatever the tree size.
+
+The type information is available without those extra calls: `createPaperLsOps.readdir` receives
+`Array<{name, type}>` and discards the type, because `LsOperations.readdir` is typed `=> string[]`.
+Widening that interface, or adding an optional `readdirWithTypes` so the local path is unchanged,
+would collapse `ls` to a single round trip. That is a change to the shipped tool interface rather
+than to the sandbox, so it is left alone here.
 
 Zone startup is reported on its own lines and never folded into per-call latency. The first run on a
 machine additionally pays a `nix build` for the zone image, which can take minutes; later runs hit

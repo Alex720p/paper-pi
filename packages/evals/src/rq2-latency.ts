@@ -53,19 +53,27 @@ const PAPER_EXTENSION = fileURLToPath(new URL("../../coding-agent/examples/exten
 const ALL_TOOLS = ["read", "bash", "ls", "grep", "find", "write", "edit"] as const;
 type ToolName = (typeof ALL_TOOLS)[number];
 
-/** Fixture size is part of the result: ls, grep and find all scale with it. */
-const FIXTURE_SOURCE_FILES = 20;
+/** Default size of src/. Part of the result: ls, grep and find all scale with it. */
+const DEFAULT_FIXTURE_SOURCE_FILES = 20;
 
 interface Options {
 	trials: number;
 	warmup: number;
 	reps: number;
 	tools: ToolName[];
+	fixture: number;
 	json: string | undefined;
 }
 
 function parseOptions(argv: string[]): Options {
-	const options: Options = { trials: 5, warmup: 3, reps: 20, tools: [...ALL_TOOLS], json: undefined };
+	const options: Options = {
+		trials: 5,
+		warmup: 3,
+		reps: 20,
+		tools: [...ALL_TOOLS],
+		fixture: DEFAULT_FIXTURE_SOURCE_FILES,
+		json: undefined,
+	};
 	for (let index = 0; index < argv.length; index++) {
 		const arg = argv[index];
 		const value = argv[index + 1];
@@ -77,6 +85,7 @@ function parseOptions(argv: string[]): Options {
 		if (arg === "--trials") options.trials = Number.parseInt(requireValue(), 10);
 		else if (arg === "--warmup") options.warmup = Number.parseInt(requireValue(), 10);
 		else if (arg === "--reps") options.reps = Number.parseInt(requireValue(), 10);
+		else if (arg === "--fixture") options.fixture = Number.parseInt(requireValue(), 10);
 		else if (arg === "--json") options.json = requireValue();
 		else if (arg === "--tools") {
 			const names = requireValue()
@@ -87,7 +96,9 @@ function parseOptions(argv: string[]): Options {
 			}
 			options.tools = names as ToolName[];
 		} else if (arg === "--help" || arg === "-h") {
-			console.log("usage: rq2-latency.ts [--trials n] [--warmup n] [--reps n] [--tools a,b] [--json path]");
+			console.log(
+				"usage: rq2-latency.ts [--trials n] [--warmup n] [--reps n] [--tools a,b] [--fixture n] [--json path]",
+			);
 			process.exit(0);
 		} else throw new Error(`unknown argument: ${arg}`);
 	}
@@ -95,6 +106,7 @@ function parseOptions(argv: string[]): Options {
 		["trials", options.trials],
 		["warmup", options.warmup],
 		["reps", options.reps],
+		["fixture", options.fixture],
 	] as const) {
 		if (!Number.isInteger(count) || count < 1) throw new Error(`--${name} must be a positive integer`);
 	}
@@ -124,7 +136,7 @@ function argsFor(tool: ToolName, index: number): Record<string, unknown> {
 	if (tool === "read") return { path: "seed.txt" };
 	if (tool === "bash") return { command: "true" };
 	// Per-repetition files live under out/ and edits/, and the read-only tools are pointed at src/,
-	// so the tree they walk is exactly FIXTURE_SOURCE_FILES whatever --reps and --warmup are set to.
+	// so the tree they walk is exactly --fixture entries whatever --reps and --warmup are set to.
 	// Scoped to "." instead, ls and grep grow with the repetition count and stop being comparable
 	// between configurations: they moved 56% and 25% between 5x20 and 3x30 before this.
 	if (tool === "write") return { path: `out/out-${index}.txt`, content: `payload ${index}\n` };
@@ -134,7 +146,7 @@ function argsFor(tool: ToolName, index: number): Record<string, unknown> {
 	return { pattern: "*.ts", path: "src" };
 }
 
-async function createFixture(withPaper: boolean, editTargets: number[]): Promise<string> {
+async function createFixture(withPaper: boolean, editTargets: number[], sourceFiles: number): Promise<string> {
 	const root = await mkdtemp(join(tmpdir(), withPaper ? "rq2-proto-" : "rq2-orig-"));
 	const cwd = join(root, "workspace");
 	await Promise.all([mkdir(cwd), mkdir(join(root, "agent"))]);
@@ -143,7 +155,7 @@ async function createFixture(withPaper: boolean, editTargets: number[]): Promise
 	await mkdir(join(cwd, "src"), { recursive: true });
 	await mkdir(join(cwd, "out"), { recursive: true });
 	await mkdir(join(cwd, "edits"), { recursive: true });
-	for (let index = 0; index < FIXTURE_SOURCE_FILES; index++) {
+	for (let index = 0; index < sourceFiles; index++) {
 		await writeFile(join(cwd, "src", `mod-${index}.ts`), `export const answer${index} = ${index};\n`);
 	}
 	await writeFile(join(cwd, "seed.txt"), "seed line one\nseed line two\n");
@@ -168,8 +180,8 @@ interface Arm {
 	lastSpanMs: () => number;
 }
 
-async function openArm(withPaper: boolean, editTargets: number[]): Promise<Arm> {
-	const root = await createFixture(withPaper, editTargets);
+async function openArm(withPaper: boolean, editTargets: number[], sourceFiles: number): Promise<Arm> {
+	const root = await createFixture(withPaper, editTargets, sourceFiles);
 	const cwd = join(root, "workspace");
 	const { modelRuntime, model, faux } = await createFakeModelRuntime();
 	const services = await createAgentSessionServices({
@@ -235,7 +247,7 @@ interface TrialResult {
 async function runTrial(withPaper: boolean, options: Options, label: string): Promise<TrialResult> {
 	const total = options.warmup + options.reps;
 	const editTargets = Array.from({ length: total }, (_value, index) => index);
-	const arm = await openArm(withPaper, editTargets);
+	const arm = await openArm(withPaper, editTargets, options.fixture);
 	const spans = new Map<ToolName, number[]>(options.tools.map((tool) => [tool, []]));
 	const firstCall = new Map<ToolName, number>();
 
@@ -316,7 +328,7 @@ async function main(): Promise<void> {
 		`config: trials=${options.trials} warmup=${options.warmup} reps=${options.reps} tools=${options.tools.join(",")}`,
 	);
 	lines.push(
-		`fixture: src/ holds ${FIXTURE_SOURCE_FILES} files and is what ls, grep and find walk; ` +
+		`fixture: src/ holds ${options.fixture} files and is what ls, grep and find walk; ` +
 			`out/ and edits/ hold ${options.warmup + options.reps} per-repetition files each`,
 	);
 	lines.push("metric: tool_execution_start -> tool_execution_end (argument validation + execute)");
@@ -346,7 +358,7 @@ async function main(): Promise<void> {
 			options.json,
 			JSON.stringify(
 				{
-					config: { ...options, fixtureSourceFiles: FIXTURE_SOURCE_FILES },
+					config: { ...options },
 					tools: rows,
 					zoneStartup: { sessionOpen: openStats, zoneBoot: bootStats },
 					raw: {
