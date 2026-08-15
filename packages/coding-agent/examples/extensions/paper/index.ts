@@ -88,30 +88,45 @@ const ZONE_PROMPT =
 	`restarts to pick it up.`;
 
 export default function (pi: ExtensionAPI): void {
-	const localCwd = process.cwd();
-	const localRead = createReadTool(localCwd);
-	const localWrite = createWriteTool(localCwd);
-	const localEdit = createEditTool(localCwd);
-	const localBash = createBashTool(localCwd);
-	const localLs = createLsTool(localCwd);
-	const localFind = createFindTool(localCwd);
-	const localGrep = createGrepTool(localCwd);
+	// Spread into the registrations below for their schema, description and renderers only; the
+	// execute bodies are all replaced. The cwd baked in here never reaches behaviour — renderers
+	// receive the real one at render time on their `context` — so it is only a placeholder.
+	const metadataCwd = process.cwd();
+	const localRead = createReadTool(metadataCwd);
+	const localWrite = createWriteTool(metadataCwd);
+	const localEdit = createEditTool(metadataCwd);
+	const localBash = createBashTool(metadataCwd);
+	const localLs = createLsTool(metadataCwd);
+	const localFind = createFindTool(metadataCwd);
+	const localGrep = createGrepTool(metadataCwd);
 
 	let config: PaperConfig | undefined;
 	let session: PaperSession | undefined;
 	let starting: Promise<PaperSession> | undefined;
 	let transcript: Transcript = nullTranscript;
 	let sessionId = `pid-${process.pid}`;
+	let sessionCwd: string | undefined;
 
-	async function ensureConfig(): Promise<PaperConfig> {
-		if (!config) config = await loadPaperConfig(localCwd, getAgentDir());
+	/**
+	 * The project directory this session is for. Every handler and every tool execute carries it on
+	 * its context; `process.cwd()` only agrees with it when pi was started from the project, which
+	 * is the CLI's habit but not a guarantee. Getting this wrong stages, mounts and searches the
+	 * wrong tree, so the fallback is a last resort rather than the normal path.
+	 */
+	function resolveCwd(ctx?: ExtensionContext): string {
+		if (ctx?.cwd) sessionCwd = ctx.cwd;
+		return sessionCwd ?? process.cwd();
+	}
+
+	async function ensureConfig(ctx?: ExtensionContext): Promise<PaperConfig> {
+		if (!config) config = await loadPaperConfig(resolveCwd(ctx), getAgentDir());
 		return config;
 	}
 
 	async function start(ctx?: ExtensionContext): Promise<PaperSession> {
-		const resolved = await ensureConfig();
+		const resolved = await ensureConfig(ctx);
 		ctx?.ui.setStatus("paper", ctx.ui.theme.fg("accent", "paper: staging workspace"));
-		const opened = await openPaperSession(localCwd, resolved, sessionId);
+		const opened = await openPaperSession(resolveCwd(ctx), resolved, sessionId);
 		session = opened;
 		ctx?.ui.setStatus("paper", ctx.ui.theme.fg("accent", "paper: sandboxed"));
 		return opened;
@@ -130,14 +145,14 @@ export default function (pi: ExtensionAPI): void {
 
 	// --- the execution zone --------------------------------------------------
 
-	function zonePath(resolved: PaperConfig): string {
-		return path.resolve(localCwd, resolved.zone.dir);
+	function zonePath(resolved: PaperConfig, ctx?: ExtensionContext): string {
+		return path.resolve(resolveCwd(ctx), resolved.zone.dir);
 	}
 
 	/** The zone's NixOS config belongs to the project, so the first run has to put it there. */
 	async function ensureZoneDir(ctx?: ExtensionContext): Promise<void> {
-		const resolved = await ensureConfig();
-		const dir = zonePath(resolved);
+		const resolved = await ensureConfig(ctx);
+		const dir = zonePath(resolved, ctx);
 		try {
 			await access(path.join(dir, "flake.nix"));
 			return;
@@ -167,7 +182,7 @@ export default function (pi: ExtensionAPI): void {
 		if (active.zone) return active.zone;
 		// Ask the session first when the zone is off: it owns that error, and scaffolding four
 		// files into somebody's repo before refusing to run anything is the wrong order.
-		if (!(await ensureConfig()).zone.enabled) return active.ensureZone();
+		if (!(await ensureConfig(ctx)).zone.enabled) return active.ensureZone();
 		await ensureZoneDir(ctx);
 
 		const accent = (text: string) => ctx?.ui.theme.fg("accent", text) ?? text;
@@ -287,7 +302,9 @@ export default function (pi: ExtensionAPI): void {
 	// --- lifecycle -----------------------------------------------------------
 
 	pi.on("session_start", async (_event, ctx) => {
-		const resolved = await ensureConfig();
+		// Before ensureConfig: it caches, and it resolves .pi/paper.json against the cwd.
+		resolveCwd(ctx);
+		const resolved = await ensureConfig(ctx);
 		sessionId = ctx.sessionManager.getSessionId();
 		if (resolved.transcript.enabled) {
 			// Created eagerly: it needs no container, and a transcript that starts at the first
@@ -303,6 +320,10 @@ export default function (pi: ExtensionAPI): void {
 		const active = session;
 		session = undefined;
 		starting = undefined;
+		// Switching sessions can change the project, so neither the config nor the cwd it was
+		// resolved against may outlive the session that established them.
+		config = undefined;
+		sessionCwd = undefined;
 		try {
 			if (active) {
 				const pending = await active.write.diff().catch(() => []);
@@ -354,7 +375,7 @@ export default function (pi: ExtensionAPI): void {
 		...localRead,
 		async execute(id, params, signal, onUpdate, ctx) {
 			const active = await ensureSession(ctx);
-			const tool = createReadTool(localCwd, { operations: createPaperReadOps(active) });
+			const tool = createReadTool(resolveCwd(ctx), { operations: createPaperReadOps(active) });
 			return tool.execute(id, params, signal, onUpdate);
 		},
 	});
@@ -364,7 +385,7 @@ export default function (pi: ExtensionAPI): void {
 		description: `${localWrite.description}\n\nThe change is staged for human approval; the real file is not modified until it is applied.`,
 		async execute(id, params, signal, onUpdate, ctx) {
 			const active = await ensureSession(ctx);
-			const tool = createWriteTool(localCwd, { operations: createPaperWriteOps(active) });
+			const tool = createWriteTool(resolveCwd(ctx), { operations: createPaperWriteOps(active) });
 			return tool.execute(id, params, signal, onUpdate);
 		},
 	});
@@ -374,7 +395,7 @@ export default function (pi: ExtensionAPI): void {
 		description: `${localEdit.description}\n\nThe change is staged for human approval; the real file is not modified until it is applied.`,
 		async execute(id, params, signal, onUpdate, ctx) {
 			const active = await ensureSession(ctx);
-			const tool = createEditTool(localCwd, { operations: createPaperEditOps(active) });
+			const tool = createEditTool(resolveCwd(ctx), { operations: createPaperEditOps(active) });
 			return tool.execute(id, params, signal, onUpdate);
 		},
 	});
@@ -383,7 +404,7 @@ export default function (pi: ExtensionAPI): void {
 		...localLs,
 		async execute(id, params, signal, onUpdate, ctx) {
 			const active = await ensureSession(ctx);
-			const tool = createLsTool(localCwd, { operations: createPaperLsOps(active) });
+			const tool = createLsTool(resolveCwd(ctx), { operations: createPaperLsOps(active) });
 			return tool.execute(id, params, signal, onUpdate);
 		},
 	});
@@ -392,7 +413,7 @@ export default function (pi: ExtensionAPI): void {
 		...localFind,
 		async execute(id, params, signal, onUpdate, ctx) {
 			const active = await ensureSession(ctx);
-			const tool = createFindTool(localCwd, { operations: createPaperFindOps(active) });
+			const tool = createFindTool(resolveCwd(ctx), { operations: createPaperFindOps(active) });
 			return tool.execute(id, params, signal, onUpdate);
 		},
 	});
@@ -405,7 +426,7 @@ export default function (pi: ExtensionAPI): void {
 			// get the status line and the scaffolding prompt.
 			await ensureZone(ctx);
 			const active = await ensureSession(ctx);
-			const tool = createBashTool(localCwd, { operations: createPaperBashOps(active) });
+			const tool = createBashTool(resolveCwd(ctx), { operations: createPaperBashOps(active) });
 			return tool.execute(id, params, signal, onUpdate);
 		},
 	});
@@ -484,7 +505,7 @@ export default function (pi: ExtensionAPI): void {
 				}),
 			}),
 			async execute(_id, params, _signal, _onUpdate, ctx) {
-				const resolved = await ensureConfig();
+				const resolved = await ensureConfig(ctx);
 				if (!resolved.zone.allowInstall) {
 					throw new Error(
 						`Installing into the zone is disabled ("zone": { "allowInstall": false }). ` +
@@ -566,7 +587,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("zone", {
 		description: "Show, restart or scaffold the execution zone",
 		handler: async (args, ctx) => {
-			const resolved = await ensureConfig();
+			const resolved = await ensureConfig(ctx);
 			const sub = args.trim();
 
 			if (sub === "init") {

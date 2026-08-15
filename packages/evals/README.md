@@ -266,6 +266,69 @@ in.
 `driver.dispose()` unwinds the run and `session.dispose()` fires paper's `session_shutdown`, which
 tears down the VM and containers. Skip them and a qemu process outlives the test.
 
+### RQ2: per-tool-call latency benchmark
+
+`src/rq2-latency.ts` measures the latency the `paper` sandbox adds to each tool call, against the
+same tools running unsandboxed. Both arms are driven through the fake-session interface, so an
+identical tool-call sequence runs with no model and no provider credentials, and the only difference
+between them is whether the extension is loaded.
+
+It is a standalone script rather than an eval, so it never runs under `npm run eval`, `test.sh` or
+CI — nothing boots a VM unless you ask it to:
+
+```bash
+node_modules/.bin/tsx --tsconfig tsconfig.json \
+  packages/evals/src/rq2-latency.ts --trials 5 --reps 20 --warmup 3
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--trials <n>` | 5 | independent rounds, each with a fresh session and a freshly booted VM |
+| `--warmup <n>` | 3 | calls per tool excluded from the table; the first one measures zone startup |
+| `--reps <n>` | 20 | measured calls per tool per trial |
+| `--tools <a,b>` | all 7 | restrict the tool set |
+| `--json <path>` | – | also write the summary and raw samples as JSON |
+
+`--trials 1 --reps 5` is a fast check. Results print to stdout at the end; progress goes to stderr,
+so stdout can be redirected on its own. Needs paper's prerequisites: Docker with gVisor as `runsc`,
+Nix with flakes, and KVM.
+
+The reported metric is the interval between the harness's `tool_execution_start` and
+`tool_execution_end` events — argument validation plus the tool's own `execute`, with none of the
+agent loop, session persistence or driver rendezvous. That instrumentation is identical in both
+arms, so the harness overhead common to both cancels in the comparison.
+
+Four things the script does deliberately, each because getting them wrong produced a wrong answer:
+
+- **Activates all seven tools explicitly.** The default active set is `read/bash/edit/write`, so
+  `ls`, `grep` and `find` otherwise return "tool not found" in microseconds and look like an
+  enormous speedup.
+- **Aborts on any tool error** rather than recording it. Error paths are fast, so a silently failing
+  tool reads as an improvement.
+- **Measures one tool group at a time**, with `read` first and `bash` second. `write` and `edit`
+  call `markLowerDirty()`, and the next `bash` re-syncs the zone's overlay; interleaving therefore
+  charges one tool's cost to another. This ordering also isolates the two setup costs — the first
+  `read` pays for opening the session, the first `bash` pays for booting the VM.
+- **Keeps the measured tree independent of the flags.** `ls`, `grep` and `find` walk `src/`, which
+  holds a fixed number of files, while per-repetition files go to `out/` and `edits/`. Scoped to
+  `.` instead, those three grow with `--reps` and stop being comparable between configurations —
+  `ls` moved 56% between `5x20` and `3x30` before this.
+- **Tears the session down properly**, emitting `session_shutdown` before `dispose()`.
+  `AgentSession.dispose()` is synchronous and does not emit it, so a process that opens many
+  sessions leaks paper's containers and VM. Measured against leaked sandboxes, VM boot inflated
+  from 14 s to 110 s and every read-zone call drifted upward across trials.
+- **Disables paper's transcript** via `.pi/paper.json`, because its `tool_call`/`tool_result` hooks
+  write JSONL inside the measured span.
+
+Expect roughly 10% run-to-run variation in the absolute means on an otherwise busy machine; the
+relative ordering and the slowdown factors are far more stable than the absolute figures. Quote
+numbers from a single run rather than mixing runs, and state the fixture size alongside `ls`,
+`grep` and `find`.
+
+Zone startup is reported on its own lines and never folded into per-call latency. The first run on a
+machine additionally pays a `nix build` for the zone image, which can take minutes; later runs hit
+the store cache.
+
 ### Writing comparative eval sets
 
 Use `evalHarnessTable(...)` with Vitest's native `describe.for(...)` to run the same inputs against multiple harnesses.
