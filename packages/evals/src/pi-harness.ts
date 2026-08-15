@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { contentText } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
@@ -55,7 +56,7 @@ export function resolveModelSelection(
 	return { provider, id };
 }
 
-function toTranscriptEvents(messages: AgentSession["messages"]): TranscriptEvent[] {
+export function toTranscriptEvents(messages: AgentSession["messages"]): TranscriptEvent[] {
 	const events: TranscriptEvent[] = [];
 	for (const message of messages) {
 		if (message.role === "user") {
@@ -85,6 +86,133 @@ function toTranscriptEvents(messages: AgentSession["messages"]): TranscriptEvent
 		}
 	}
 	return events;
+}
+
+/** Token, tool-call, and cost telemetry for a finished eval session. */
+export function toHarnessUsage(session: AgentSession, model: Model<Api>): SimpleHarnessResult<JsonValue>["usage"] {
+	const stats = session.getSessionStats();
+	const hasPricing = [model.cost, ...(model.cost.tiers ?? [])].some(
+		({ input, output, cacheRead, cacheWrite }) => input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0,
+	);
+	return {
+		provider: model.provider,
+		model: model.id,
+		inputTokens: stats.tokens.input,
+		outputTokens: stats.tokens.output,
+		totalTokens: stats.tokens.total,
+		toolCalls: stats.toolCalls,
+		metadata: {
+			cacheReadTokens: stats.tokens.cacheRead,
+			cacheWriteTokens: stats.tokens.cacheWrite,
+			...(hasPricing ? { estimatedCostUsd: stats.cost } : {}),
+		},
+	};
+}
+
+export interface EvalSessionOptions {
+	modelRuntime: ModelRuntime;
+	model: Model<Api>;
+	setArtifact: HarnessContext["setArtifact"];
+	signal: AbortSignal | undefined;
+	noTools?: CreateAgentSessionOptions["noTools"];
+	transformSystemPrompt?: (defaultPrompt: string) => string;
+}
+
+/**
+ * Runs `body` against a throwaway `AgentSession` in isolated temporary project
+ * and agent directories, snapshots the native session JSONL as an artifact, and
+ * removes the temporary root afterwards. Cleanup runs even when `body` throws.
+ */
+export async function withEvalSession<T>(
+	options: EvalSessionOptions,
+	body: (session: AgentSession) => Promise<T>,
+): Promise<T> {
+	options.signal?.throwIfAborted();
+	const root = await mkdtemp(join(tmpdir(), "pi-eval-"));
+	const cwd = join(root, "workspace");
+	const agentDir = join(root, "agent");
+	let transformedSystemPrompt: string | undefined;
+	let sessionManager: SessionManager | undefined;
+	let session: AgentSession | undefined;
+	let outcome: { success: true; value: T } | { success: false; error: unknown };
+	try {
+		await Promise.all([mkdir(cwd), mkdir(agentDir)]);
+		const services = await createAgentSessionServices({
+			cwd,
+			agentDir,
+			modelRuntime: options.modelRuntime,
+			settingsManager: SettingsManager.inMemory(),
+			...(options.transformSystemPrompt
+				? { resourceLoaderOptions: { systemPromptOverride: () => transformedSystemPrompt } }
+				: {}),
+		});
+		options.signal?.throwIfAborted();
+		sessionManager = SessionManager.create(cwd, join(root, "sessions"));
+		options.setArtifact("runId", sessionManager.getSessionId());
+		session = (
+			await createAgentSessionFromServices({
+				services,
+				sessionManager,
+				model: options.model,
+				thinkingLevel: "off",
+				noTools: options.noTools,
+			})
+		).session;
+
+		const evalSession = session;
+		if (options.transformSystemPrompt) {
+			transformedSystemPrompt = options.transformSystemPrompt(evalSession.systemPrompt);
+			if (!transformedSystemPrompt.trim()) throw new Error("Transformed eval system prompt must not be empty.");
+			await evalSession.reload();
+		}
+		let abortPromise: Promise<void> | undefined;
+		const abort = () => {
+			abortPromise ??= evalSession.abort();
+		};
+		options.signal?.addEventListener("abort", abort, { once: true });
+		try {
+			options.signal?.throwIfAborted();
+			if (evalSession.extensionRunner.getExtensionPaths().length !== 0) {
+				throw new Error("Expected an isolated eval session to start without extensions.");
+			}
+			outcome = { success: true, value: await body(evalSession) };
+		} finally {
+			options.signal?.removeEventListener("abort", abort);
+			if (abortPromise) await abortPromise;
+		}
+	} catch (error) {
+		outcome = { success: false, error };
+	}
+
+	const cleanupErrors: unknown[] = [];
+	if (sessionManager) {
+		try {
+			const sessionPath = sessionManager.getSessionFile();
+			if (sessionPath && existsSync(sessionPath)) {
+				options.setArtifact(PI_SESSION_SNAPSHOT_ARTIFACT, await readFile(sessionPath, "utf8"));
+			}
+		} catch (error) {
+			cleanupErrors.push(error);
+		}
+	}
+	try {
+		session?.dispose();
+	} catch (error) {
+		cleanupErrors.push(error);
+	}
+	try {
+		await rm(root, { recursive: true, force: true });
+	} catch (error) {
+		cleanupErrors.push(error);
+	}
+
+	if (!outcome.success) {
+		if (cleanupErrors.length === 0) throw outcome.error;
+		throw new AggregateError([outcome.error, ...cleanupErrors], "Agent run failed and cleanup also failed.");
+	}
+	if (cleanupErrors.length === 1) throw cleanupErrors[0];
+	if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, "Agent cleanup failed.");
+	return outcome.value;
 }
 
 async function promptAgent(session: AgentSession, input: string, signal: AbortSignal | undefined): Promise<string> {
@@ -119,128 +247,36 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 	const model = modelRuntime.getModel(selection.provider, selection.id);
 	if (!model) throw new Error(`Eval model not found: ${selection.provider}/${selection.id}`);
 
-	const root = await mkdtemp(join(tmpdir(), "pi-eval-"));
-	const cwd = join(root, "workspace");
-	const agentDir = join(root, "agent");
-	let transformedSystemPrompt: string | undefined;
-	let sessionManager: SessionManager | undefined;
-	let session: AgentSession | undefined;
-	let outcome: { success: true; result: SimpleHarnessResult<string | TOutput> } | { success: false; error: unknown };
-	try {
-		await Promise.all([mkdir(cwd), mkdir(agentDir)]);
-		const services = await createAgentSessionServices({
-			cwd,
-			agentDir,
+	const result = await withEvalSession(
+		{
 			modelRuntime,
-			settingsManager: SettingsManager.inMemory(),
-			...(options.transformSystemPrompt
-				? { resourceLoaderOptions: { systemPromptOverride: () => transformedSystemPrompt } }
-				: {}),
-		});
-		signal?.throwIfAborted();
-		sessionManager = SessionManager.create(cwd, join(root, "sessions"));
-		setArtifact("runId", sessionManager.getSessionId());
-		session = (
-			await createAgentSessionFromServices({
-				services,
-				sessionManager,
-				model,
-				thinkingLevel: "off",
-				noTools: options.noTools,
-			})
-		).session;
-
-		const evalSession = session;
-		if (options.transformSystemPrompt) {
-			transformedSystemPrompt = options.transformSystemPrompt(evalSession.systemPrompt);
-			if (!transformedSystemPrompt.trim()) throw new Error("Transformed eval system prompt must not be empty.");
-			await evalSession.reload();
-		}
-		let abortPromise: Promise<void> | undefined;
-		const abort = () => {
-			abortPromise ??= evalSession.abort();
-		};
-		signal?.addEventListener("abort", abort, { once: true });
-		try {
-			signal?.throwIfAborted();
-			if (evalSession.extensionRunner.getExtensionPaths().length !== 0) {
-				throw new Error("Expected an isolated eval session to start without extensions.");
-			}
+			model,
+			setArtifact,
+			signal,
+			noTools: options.noTools,
+			transformSystemPrompt: options.transformSystemPrompt,
+		},
+		async (session) => {
 			const steps = typeof input === "string" ? [{ type: "prompt" as const, content: input }] : input;
 			let response: string | undefined;
 			for (const step of steps) {
 				if (step.type === "prompt") {
-					response = await promptAgent(evalSession, step.content, signal);
+					response = await promptAgent(session, step.content, signal);
 				} else {
-					await evalSession.reload();
+					await session.reload();
 				}
 			}
 			if (response === undefined) throw new Error("Pi eval input must include at least one prompt step.");
-			const output = "output" in options ? await options.output({ response, session: evalSession }) : response;
-			const stats = evalSession.getSessionStats();
-			const hasPricing = [model.cost, ...(model.cost.tiers ?? [])].some(
-				({ input, output, cacheRead, cacheWrite }) => input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0,
-			);
-			outcome = {
-				success: true,
-				result: {
-					output,
-					events: toTranscriptEvents(evalSession.messages),
-					usage: {
-						provider: model.provider,
-						model: model.id,
-						inputTokens: stats.tokens.input,
-						outputTokens: stats.tokens.output,
-						totalTokens: stats.tokens.total,
-						toolCalls: stats.toolCalls,
-						metadata: {
-							cacheReadTokens: stats.tokens.cacheRead,
-							cacheWriteTokens: stats.tokens.cacheWrite,
-							...(hasPricing ? { estimatedCostUsd: stats.cost } : {}),
-						},
-					},
-				},
-			};
-		} finally {
-			signal?.removeEventListener("abort", abort);
-			if (abortPromise) await abortPromise;
-		}
-	} catch (error) {
-		outcome = { success: false, error };
-	}
+			const output = "output" in options ? await options.output({ response, session }) : response;
+			return {
+				output,
+				events: toTranscriptEvents(session.messages),
+				usage: toHarnessUsage(session, model),
+			} satisfies SimpleHarnessResult<string | TOutput>;
+		},
+	);
 
-	const cleanupErrors: unknown[] = [];
-	if (sessionManager) {
-		try {
-			const sessionPath = sessionManager.getSessionFile();
-			if (sessionPath && existsSync(sessionPath)) {
-				setArtifact(PI_SESSION_SNAPSHOT_ARTIFACT, await readFile(sessionPath, "utf8"));
-			}
-		} catch (error) {
-			cleanupErrors.push(error);
-		}
-	}
-	try {
-		session?.dispose();
-	} catch (error) {
-		cleanupErrors.push(error);
-	}
-	try {
-		await rm(root, { recursive: true, force: true });
-	} catch (error) {
-		cleanupErrors.push(error);
-	}
-
-	if (!outcome.success) {
-		if (cleanupErrors.length === 0) throw outcome.error;
-		throw new AggregateError([outcome.error, ...cleanupErrors], "Agent run failed and cleanup also failed.");
-	}
-	if (cleanupErrors.length === 1) throw cleanupErrors[0];
-	if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, "Agent cleanup failed.");
-	return {
-		...outcome.result,
-		timings: { totalMs: performance.now() - startedAt },
-	};
+	return { ...result, timings: { totalMs: performance.now() - startedAt } };
 }
 
 export function createPiCodingAgentHarness<TOutput extends JsonValue>(

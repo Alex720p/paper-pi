@@ -108,6 +108,13 @@ node_modules/.bin/tsx --tsconfig tsconfig.json \
 Set `PAPER_ZONE_DEBUG=1` to trace the boot when a zone will not come up; the guest's serial console
 is captured to `console.log` in the session's temp directory either way.
 
+`smoke.ts` calls the operations in `tools.ts` directly, so it checks the zones but not the agent
+around them. To drive the tools pi actually registers — through the agent loop, the tool hooks and
+session persistence, and still without an LLM — use a fake session from
+[`packages/evals`](../../../../evals/README.md#driving-a-sandboxed-backend-the-paper-extension). You
+issue the tool calls a model would otherwise choose, so a `write` followed by `bash cat` is a
+deterministic check that the write container and the zone agree on one tree.
+
 ## How it fits together
 
 Everything agrees on one tree: the **scratchpad**, a host directory mounted into every sandbox that

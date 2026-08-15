@@ -101,6 +101,171 @@ const harness = createPiCodingAgentHarness({
 Assert application behavior on `result.output`. Assert model and tool traces on `result.session`, using
 `vitest-evals` helpers such as `toolCalls(...)`.
 
+### Fake sessions
+
+A fake session runs a real `AgentSession` with **no model behind it**: the benchmark author issues
+every assistant message, so tool calls are chosen by test code instead of an LLM. Everything
+downstream of that message still runs for real — the agent loop, tool dispatch, tool hooks, session
+JSONL persistence, and session events all behave exactly as in a model-backed session.
+
+Use fake sessions to benchmark Pi itself — tool backends, exec zones, persistence, extension hooks —
+deterministically, with no provider credentials and no tokens. They measure the harness, not the
+model, so they do not belong in model-comparison eval sets.
+
+```ts
+import { expect } from "vitest";
+import { describeEval } from "vitest-evals";
+import { createFakeSessionHarness } from "./fake-session-harness.ts";
+
+const harness = createFakeSessionHarness<{ path: string }, string>({
+	drive: async (driver, input) => {
+		await driver.start("Round-trip a file.");
+		await driver.toolCall("write", { path: input.path, content: "hello" });
+		const read = await driver.toolCall("read", { path: input.path });
+		expect(read.isError).toBe(false);
+		return await driver.finish("Round-trip complete.");
+	},
+});
+
+describeEval("tool round-trip", { harness }, (it) => {
+	it("writes and reads a file", async ({ run }) => {
+		const result = await run({ path: "note.txt" });
+		expect(result.output).toBe("Round-trip complete.");
+		expect(result.usage.toolCalls).toBe(2);
+	});
+});
+```
+
+`createFakeSessionHarness(...)` accepts `name`, `noTools`, and `transformSystemPrompt` exactly like
+the model-backed harness, plus:
+
+- `drive`: receives the `FakeSessionDriver` and the run input, and returns the JSON-safe output.
+- `stepTimeoutMs`: how long one driver step waits for the harness before failing. Defaults to 30s,
+  so a wedged drive fails loudly instead of hanging Vitest.
+
+The driver API:
+
+- `start(prompt)` sends the user message that opens a run and resolves once the harness asks for its
+  first assistant message.
+- `toolCall(name, args, { text?, id? })` issues one tool call and resolves with its
+  `{ toolCallId, toolName, text, content, isError }` result. A failing tool returns `isError: true`
+  rather than throwing.
+- `toolCalls([...])` puts several calls in one assistant message, exercising parallel tool
+  execution; results come back in the requested order.
+- `finish(text)` ends the run with a text-only assistant message and returns the final text.
+- `reload()` reloads session resources between runs, and `session` exposes the underlying
+  `AgentSession` for assertions.
+
+Keep `input` JSON-serializable so `vitest-evals` keeps hashing it for run grouping and comparative
+harness tables; the driving logic belongs in `drive`, not in the input.
+
+Fake sessions use a large context window so auto-compaction never consumes a driver instruction
+mid-run. A benchmark that needs compaction should trigger it explicitly.
+
+#### Driving a sandboxed backend (the paper extension)
+
+The driver does not care what is behind a tool. Load an extension that reroutes the built-in tools
+and the same `toolCall(...)` sequence exercises the real backend, still with no model. With the
+[`paper`](../coding-agent/examples/extensions/paper) extension, `write` stages through a gVisor
+container and `bash` runs inside a microVM, so a driven `write` then `bash cat` proves the two
+sandboxes agree on one tree.
+
+This needs paper's own prerequisites — Docker with gVisor registered as `runsc`, Nix with flakes,
+KVM (`/dev/kvm`, and your user in the `kvm` group), `paper-api` built, and `npm install
+--ignore-scripts` in the extension directory. See that extension's README for setup.
+
+`createFakeSessionHarness(...)` cannot load extensions: like the model-backed harness, it asserts an
+eval session starts with none, so an eval never silently picks up whatever is installed on the
+machine. Build the session yourself and use the driver directly:
+
+```ts
+import { mkdir, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	createAgentSessionFromServices,
+	createAgentSessionServices,
+	initTheme,
+	SessionManager,
+	SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+// paper-api is a `file:` dependency of the extension, not a workspace package,
+// so it resolves through the extension's own node_modules.
+import { scaffoldZoneDir } from "<repo>/packages/coding-agent/examples/extensions/paper/node_modules/paper-api/dist/index.js";
+import { FakeSessionDriver } from "./fake-session/driver.ts";
+import { createFakeModelRuntime } from "./fake-session/model.ts";
+
+const PAPER = "<repo>/packages/coding-agent/examples/extensions/paper";
+
+// paper's tools render through Pi's theme, which the CLI initializes at startup
+// and a bare programmatic session does not. Without this every tool call comes
+// back as an error result reading "Theme not initialized".
+initTheme("dark");
+
+const root = await mkdtemp(join(tmpdir(), "paper-zone-"));
+const cwd = join(root, "workspace");
+const agentDir = join(root, "agent");
+await Promise.all([mkdir(cwd), mkdir(agentDir)]);
+// The zone builds from the project's own NixOS config. Interactively the first
+// bash call offers to create this; headless there is nothing to accept with.
+await scaffoldZoneDir(join(cwd, ".pi", "zone"));
+
+const { modelRuntime, model, faux } = await createFakeModelRuntime();
+const services = await createAgentSessionServices({
+	cwd,
+	agentDir,
+	modelRuntime,
+	settingsManager: SettingsManager.inMemory(),
+	// The programmatic equivalent of `pi -e <path>`.
+	resourceLoaderOptions: { additionalExtensionPaths: [PAPER] },
+});
+const { session } = await createAgentSessionFromServices({
+	services,
+	sessionManager: SessionManager.create(cwd, join(root, "sessions")),
+	model,
+	thinkingLevel: "off",
+});
+
+// The zone boots on the first bash call and lives for the session, so allow
+// far more than the 30s default per step.
+const driver = new FakeSessionDriver({ session, faux, stepTimeoutMs: 600_000 });
+try {
+	await driver.start("Create a file and read it back from the shell.");
+
+	// Assert you are in the VM rather than assuming it: the guest reports its
+	// own kernel, `paper-zone` as the hostname, and /workspace as the cwd.
+	const zone = await driver.toolCall("bash", { command: "uname -r; hostname; pwd" });
+	console.log(zone.text);
+
+	await driver.toolCall("write", { path: "probe.txt", content: "written by the fake model" });
+	const catted = await driver.toolCall("bash", { command: "cat probe.txt" });
+	console.log(catted.text); // written by the fake model
+
+	await driver.finish("Done.");
+} finally {
+	await driver.dispose();
+	session.dispose();
+}
+```
+
+Check that the extension actually loaded before trusting a green run — without it the tools fall
+back to the host and the same script still passes:
+
+```ts
+const paths = session.extensionRunner.getExtensionPaths();
+if (!paths.some((path) => path.includes("paper"))) throw new Error("paper extension did not load");
+```
+
+No approval is involved in the flow above, even though paper gates file changes. `write` only
+*stages* into the scratchpad, and the zone mounts that staged tree as the lower layer of its overlay
+(`lowerSource: "staged"`), so the zone sees the file without anything reaching the real project.
+Asserting that a change lands on the **host** is a different test: it needs `"autoCommit": true` in
+the project's `.pi/paper.json`, which is off by default precisely because there is no UI to approve
+in.
+
+`driver.dispose()` unwinds the run and `session.dispose()` fires paper's `session_shutdown`, which
+tears down the VM and containers. Skip them and a qemu process outlives the test.
+
 ### Writing comparative eval sets
 
 Use `evalHarnessTable(...)` with Vitest's native `describe.for(...)` to run the same inputs against multiple harnesses.
