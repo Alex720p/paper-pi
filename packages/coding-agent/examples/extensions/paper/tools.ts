@@ -122,6 +122,11 @@ export function createPaperEditOps(session: PaperSession): EditOperations {
 	};
 }
 
+export async function executePaperDelete(session: PaperSession, filePath: string): Promise<void> {
+	await session.write.deleteFile(relativeInWorkspace(session, filePath));
+	session.zone?.markLowerDirty();
+}
+
 export function createPaperLsOps(session: PaperSession): LsOperations {
 	return {
 		exists: async (filePath) => {
@@ -348,9 +353,11 @@ export async function executePaperGrep(
 /** Where a host directory lands inside the zone. Paths outside the workspace have no guest
  * equivalent, so they collapse onto the workspace root rather than escaping it. */
 function guestCwd(session: PaperSession, hostCwd: string): string {
+	const workspace =
+		session.config.zone.backend === "docker" ? (session.config.zone.workspacePath ?? "/app") : SANDBOX_WORKSPACE;
 	const located = locate(session, hostCwd);
-	if (located.where !== "workspace" || located.relative === ".") return SANDBOX_WORKSPACE;
-	return path.posix.join(SANDBOX_WORKSPACE, located.relative.split(path.sep).join(path.posix.sep));
+	if (located.where !== "workspace" || located.relative === ".") return workspace;
+	return path.posix.join(workspace, located.relative.split(path.sep).join(path.posix.sep));
 }
 
 export function createPaperBashOps(session: PaperSession): BashOperations {

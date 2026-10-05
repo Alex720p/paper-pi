@@ -49,11 +49,11 @@ import {
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 
-import { createTranscript, type ExecZone, nullTranscript, scaffoldZoneDir, type Transcript } from "paper-api";
+import { createTranscript, nullTranscript, scaffoldZoneDir, type Transcript } from "paper-api";
 import { Type } from "typebox";
 
 import { loadPaperConfig, type PaperConfig } from "./config.ts";
-import { openPaperSession, type PaperSession } from "./session.ts";
+import { openPaperSession, type PaperExecutionZone, type PaperSession } from "./session.ts";
 import {
 	createPaperBashOps,
 	createPaperEditOps,
@@ -61,6 +61,7 @@ import {
 	createPaperLsOps,
 	createPaperReadOps,
 	createPaperWriteOps,
+	executePaperDelete,
 	executePaperGrep,
 	SANDBOX_WORKSPACE,
 } from "./tools.ts";
@@ -86,6 +87,19 @@ const ZONE_PROMPT =
 	`zone_install with the nixpkgs attribute names for it (for example ["nodejs"] for node and ` +
 	`npm, ["python3"], ["go"]). The user is asked before anything is installed, and the zone ` +
 	`restarts to pick it up.`;
+
+const DOCKER_ZONE_PROMPT =
+	"Shell commands run in a temporary Docker exec zone with no network. " +
+	"Read/write/edit/delete_file/ls/grep/find accept repository-relative paths or the exec workspace path and inspect the staged tree. " +
+	"Bash uses that workspace path as a private overlay of the staged tree. Host working-directory paths are unavailable in bash. " +
+	"The task image provides its dependencies. Shell writes and deletions stay private to exec, " +
+	"persist between commands, and are discarded at session close. They are never submitted. " +
+	"Use write and edit tools for every source change intended for submission. " +
+	"Use delete_file to remove staged source files; shell rm only removes the private exec copy. " +
+	"Private shell changes shadow staged files even after a staged edit. " +
+	"Use read before edit to get staged contents; bash cat may show a different private version. " +
+	"Run formatters in check mode, or copy final generated contents through write. " +
+	"The evaluation harness commits staged changes for you; a shell git commit is not submitted.";
 
 export default function (pi: ExtensionAPI): void {
 	// Spread into the registrations below for their schema, description and renderers only; the
@@ -152,6 +166,7 @@ export default function (pi: ExtensionAPI): void {
 	/** The zone's NixOS config belongs to the project, so the first run has to put it there. */
 	async function ensureZoneDir(ctx?: ExtensionContext): Promise<void> {
 		const resolved = await ensureConfig(ctx);
+		if (resolved.zone.backend === "docker") return;
 		const dir = zonePath(resolved, ctx);
 		try {
 			await access(path.join(dir, "flake.nix"));
@@ -177,7 +192,7 @@ export default function (pi: ExtensionAPI): void {
 	 * The VM, built on first use. It costs a `nix build` and a boot, and plenty of sessions never
 	 * run a command at all, so nothing here happens at startup.
 	 */
-	async function ensureZone(ctx?: ExtensionContext): Promise<ExecZone> {
+	async function ensureZone(ctx?: ExtensionContext): Promise<PaperExecutionZone> {
 		const active = await ensureSession(ctx);
 		if (active.zone) return active.zone;
 		// Ask the session first when the zone is off: it owns that error, and scaffolding four
@@ -191,7 +206,7 @@ export default function (pi: ExtensionAPI): void {
 			const zone = await active.ensureZone((line) => {
 				ctx?.ui.setStatus("paper", accent(`paper: ${line.slice(0, 60)}`));
 			});
-			ctx?.ui.setStatus("paper", accent(`paper: zone up (cid ${zone.cid})`));
+			ctx?.ui.setStatus("paper", accent(`paper: exec zone up`));
 			return zone;
 		} catch (error) {
 			ctx?.ui.setStatus("paper", ctx.ui.theme.fg("error", "paper: zone failed"));
@@ -306,6 +321,15 @@ export default function (pi: ExtensionAPI): void {
 		resolveCwd(ctx);
 		const resolved = await ensureConfig(ctx);
 		sessionId = ctx.sessionManager.getSessionId();
+		pi.setActiveTools(
+			pi
+				.getActiveTools()
+				.filter(
+					(name) =>
+						(name !== "zone_install" || resolved.zone.backend === "nix") &&
+						(name !== "fetch_url" || resolved.network.enabled),
+				),
+		);
 		if (resolved.transcript.enabled) {
 			// Created eagerly: it needs no container, and a transcript that starts at the first
 			// tool call would miss the prompt that caused it.
@@ -317,7 +341,7 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		const active = session;
+		const active = session ?? (await starting);
 		session = undefined;
 		starting = undefined;
 		// Switching sessions can change the project, so neither the config nor the cwd it was
@@ -326,18 +350,24 @@ export default function (pi: ExtensionAPI): void {
 		sessionCwd = undefined;
 		try {
 			if (active) {
-				const pending = await active.write.diff().catch(() => []);
-				if (pending.length > 0) {
-					ctx.ui.notify(
-						`Discarding ${pending.length} unapplied staged change(s): ` +
-							`${pending.map((entry) => entry.path).join(", ")}`,
-						"warning",
-					);
+				try {
+					const pending = await active.write.diff();
+					if (pending.length > 0 && active.config.autoCommit) {
+						const result = await active.write.commit();
+						if (result.conflicts.length > 0) throw new Error("Staged changes conflicted during shutdown");
+					} else if (pending.length > 0) {
+						ctx.ui.notify(
+							`Discarding ${pending.length} unapplied staged change(s): ` +
+								`${pending.map((entry) => entry.path).join(", ")}`,
+							"warning",
+						);
+					}
+				} finally {
+					await active.close();
 				}
-				await active.close();
 			}
-			await transcript.close();
 		} finally {
+			await transcript.close();
 			transcript = nullTranscript;
 			ctx.ui.setStatus("paper", undefined);
 		}
@@ -400,6 +430,22 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerTool(
+		defineTool({
+			name: "delete_file",
+			label: "Delete",
+			description:
+				"Delete a staged workspace file through the write zone. The deletion is applied with other staged edits. " +
+				"Shell rm only affects the private exec copy and cannot submit a deletion.",
+			promptSnippet: "delete_file: remove a staged workspace file",
+			parameters: Type.Object({ path: Type.String({ description: "The workspace file to delete" }) }),
+			async execute(_id, params, _signal, _onUpdate, ctx) {
+				await executePaperDelete(await ensureSession(ctx), params.path);
+				return { content: [{ type: "text", text: `Deleted staged file: ${params.path}` }], details: undefined };
+			},
+		}),
+	);
+
 	pi.registerTool({
 		...localLs,
 		async execute(id, params, signal, onUpdate, ctx) {
@@ -420,14 +466,24 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		...localBash,
-		description: `${localBash.description}\n\n${SANDBOX_NOTE}`,
+		description: `${localBash.description}\n\nShell changes stay private to exec. Use write/edit for durable source edits.`,
 		async execute(id, params, signal, onUpdate, ctx) {
 			// Build the zone here rather than inside the operations, so its `nix build` and boot
 			// get the status line and the scaffolding prompt.
 			await ensureZone(ctx);
 			const active = await ensureSession(ctx);
 			const tool = createBashTool(resolveCwd(ctx), { operations: createPaperBashOps(active) });
-			return tool.execute(id, params, signal, onUpdate);
+			const result = await tool.execute(id, params, signal, onUpdate);
+			if (active.config.zone.backend === "docker") {
+				result.content.push({
+					type: "text",
+					text:
+						"[Exec changes are private and are never submitted. Use write/edit/delete_file for source changes. " +
+						"Use read before edit to get staged contents; bash may show a private version. " +
+						"Copy final shell-generated or formatted source through write before finishing.]",
+				});
+			}
+			return result;
 		},
 	});
 
@@ -515,6 +571,7 @@ export default function (pi: ExtensionAPI): void {
 				if (params.packages.length === 0) throw new Error("No packages given.");
 
 				const zone = await ensureZone(ctx);
+				if (!("packages" in zone)) throw new Error("zone_install is only available with the NixOS backend");
 				const current = await zone.packages();
 				const wanted = params.packages.filter((name) => !current.includes(name));
 				if (wanted.length === 0) {
@@ -601,7 +658,7 @@ export default function (pi: ExtensionAPI): void {
 				await zone.restart((line) => {
 					ctx.ui.setStatus("paper", ctx.ui.theme.fg("accent", `paper: ${line.slice(0, 60)}`));
 				});
-				ctx.ui.setStatus("paper", ctx.ui.theme.fg("accent", `paper: zone up (cid ${zone.cid})`));
+				ctx.ui.setStatus("paper", ctx.ui.theme.fg("accent", `paper: exec zone up`));
 				ctx.ui.notify("The zone restarted. Running processes are gone; files it held were carried across.", "info");
 				return;
 			}
@@ -617,12 +674,20 @@ export default function (pi: ExtensionAPI): void {
 
 			const zone = session.zone;
 			const status = zone.status();
+			if ("backend" in status) {
+				ctx.ui.notify(
+					`Docker exec: ${status.containerId}\nImage: ${status.image}\n` +
+						`Workspace: ${status.workspacePath} (private overlay)\nState: ${status.state}`,
+					"info",
+				);
+				return;
+			}
 			ctx.ui.notify(
 				[
 					`Zone: cid ${status.cid}, pid ${status.pid ?? "?"}, ${status.restarts} restart(s)`,
 					`Workspace: ${SANDBOX_WORKSPACE} (overlay over ${status.lowerSource}, read-only)`,
 					`Config: ${resolved.zone.dir}`,
-					`Packages: ${(await zone.packages()).join(", ")}`,
+					`Packages: ${"packages" in zone ? (await zone.packages()).join(", ") : ""}`,
 					`Session dir: ${status.sessionDir}`,
 				].join("\n"),
 				"info",
@@ -630,7 +695,12 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("before_agent_start", (event) => {
-		return { systemPrompt: `${event.systemPrompt}\n\n${ZONE_PROMPT}` };
+	pi.on("before_agent_start", async (event, ctx) => {
+		const resolved = await ensureConfig(ctx);
+		const prompt =
+			resolved.zone.backend === "docker"
+				? `${DOCKER_ZONE_PROMPT}\nExec working directory: ${resolved.zone.workspacePath ?? "/app"}.`
+				: `${SANDBOX_NOTE}\n${ZONE_PROMPT}`;
+		return { systemPrompt: `${event.systemPrompt}\n\n${prompt}` };
 	});
 }

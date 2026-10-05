@@ -146,6 +146,7 @@ async function run(): Promise<void> {
 		record("zone", "sees staged edit", cat.output);
 
 		const zoneStatus = active.zone?.status();
+		if (!zoneStatus || "backend" in zoneStatus) throw new Error("This smoke test requires the NixOS backend");
 		assert(zoneStatus !== undefined && zoneStatus.pid !== undefined, "the zone has a running VM");
 		record("zone", "vm", `cid ${zoneStatus?.cid}, pid ${zoneStatus?.pid}`);
 
@@ -204,7 +205,8 @@ async function run(): Promise<void> {
 		assert(/^timeout:/.test(timedOut), `a slow command times out, got: ${timedOut}`);
 		record("zone", "timeout", timedOut);
 
-		const resolved = await active.zone?.resolvePackages(["hello", "definitely-not-a-package"]);
+		if (!active.zone || !("resolvePackages" in active.zone)) throw new Error("Expected the NixOS backend");
+		const resolved = await active.zone.resolvePackages(["hello", "definitely-not-a-package"]);
 		assert(resolved?.known.join() === "hello", "a real nixpkgs attribute resolves");
 		assert(resolved?.unknown.join() === "definitely-not-a-package", "a made-up one does not");
 		record("zone", "package names checked before install", `known=${resolved?.known}, unknown=${resolved?.unknown}`);

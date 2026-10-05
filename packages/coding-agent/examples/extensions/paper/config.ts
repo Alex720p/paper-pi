@@ -12,6 +12,11 @@ import type { ExecZoneTuning } from "paper-api";
  * defaulted in one place. What is left below is the part that is pi policy rather than VM shape.
  */
 export interface ZoneConfig extends ExecZoneTuning {
+	backend: "nix" | "docker";
+	/** Task image and its repository directory, used by the Docker backend. */
+	image?: string;
+	workspacePath?: string;
+	env?: Record<string, string>;
 	/** Off falls back to nothing: `bash` has no backend, so the tool refuses to run. */
 	enabled: boolean;
 	/** Where the zone's NixOS config lives, relative to the working directory. */
@@ -30,6 +35,9 @@ export interface ZoneConfig extends ExecZoneTuning {
  *   <cwd>/.pi/paper.json
  */
 export interface PaperConfig {
+	/** Runtime for the read/write/network containers; exec Docker uses runc. */
+	runtime: string;
+	network: { enabled: boolean };
 	/** Extra host paths the agent may read, outside the working directory. Read-only. */
 	readPaths: string[];
 	workspace: {
@@ -68,6 +76,8 @@ export interface PaperConfig {
 }
 
 export const DEFAULT_CONFIG: PaperConfig = {
+	runtime: "runsc",
+	network: { enabled: true },
 	readPaths: [],
 	workspace: {
 		include: ["."],
@@ -82,6 +92,7 @@ export const DEFAULT_CONFIG: PaperConfig = {
 	},
 	// Anything not named here keeps paper-api's default; see DEFAULT_EXEC_ZONE.
 	zone: {
+		backend: "nix",
 		enabled: true,
 		dir: ".pi/zone",
 		lowerSource: "staged",
@@ -128,6 +139,12 @@ async function readJsonIfPresent(file: string): Promise<Record<string, unknown> 
 }
 
 export async function loadPaperConfig(cwd: string, agentDir: string): Promise<PaperConfig> {
+	// A trusted harness may pin its profile independently of task-local configuration.
+	if (process.env.PAPER_CONFIG_PATH) {
+		const pinned = await readJsonIfPresent(process.env.PAPER_CONFIG_PATH);
+		if (!pinned) throw new Error(`Paper profile does not exist: ${process.env.PAPER_CONFIG_PATH}`);
+		return mergeInto(DEFAULT_CONFIG as unknown as Record<string, unknown>, pinned) as unknown as PaperConfig;
+	}
 	const global = await readJsonIfPresent(path.join(agentDir, "extensions", "paper.json"));
 	const project = await readJsonIfPresent(path.join(cwd, ".pi", "paper.json"));
 

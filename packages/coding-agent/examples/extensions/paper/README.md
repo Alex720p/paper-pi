@@ -9,15 +9,15 @@ exactly one dangerous capability.
 | pi tool | Where it runs | What it can do |
 |---|---|---|
 | `read` `ls` `grep` `find` | a gVisor container with the staged tree mounted **read-only** | read only; no network, no exec |
-| `write` `edit` | a second container with it mounted **read-write** | stage a change; the real file needs approval |
-| `bash`, `!` commands | **the zone**: a microvm.nix VM that lives as long as the session | run anything; no network; nothing escapes |
+| `write` `edit` `delete_file` | a second container with it mounted **read-write** | stage a change; the real file needs approval |
+| `bash`, `!` commands | **the exec zone**: a Nix VM by default, or a Docker task container | run anything; no network; shell writes stay private |
 | `zone_install` | a host-side `nix build` you approve | add packages to the zone |
 | `fetch_url` | a container with **zero** filesystem mounts, alive as long as the session | reach the network; nothing local to exfiltrate |
 
 No single sandbox can both read and write, and the only one that runs arbitrary commands has
 neither a network device nor a way to reach the host.
 
-## The zone
+## The Nix zone (default)
 
 `bash` runs in a NixOS micro-VM built by [microvm.nix](https://github.com/microvm-nix/microvm.nix).
 It boots on the first command and lives until the session ends, which is the point: **everything in
@@ -70,7 +70,49 @@ the files the agent had created in the zone are carried back in. Running process
 restart is a restart. The rebuild is the only time anything reaches the network, it happens on the
 host, and it happens because you said yes.
 
-## Setup
+## Docker task images and evals
+
+Select Docker execution in `.pi/paper.json`:
+
+```json
+{
+  "runtime": "runc",
+  "zone": {
+    "backend": "docker",
+    "image": "my-task:local",
+    "workspacePath": "/app",
+    "lowerSource": "staged",
+    "allowInstall": false
+  },
+  "network": { "enabled": true }
+}
+```
+
+The read and write containers remain separate, and `fetch_url` still uses a separate container
+without filesystem mounts. `runtime` selects the read/write/network runtime; Docker exec uses
+`runc`. Exec and network start lazily and are reused for the session. With networking disabled,
+`fetch_url` is removed from the active tool set and no network container starts.
+
+The image supplies the toolchain and dependencies. Paper copies its repository into a private
+Docker volume and places staged source edits beneath a real overlayfs upper. Shell writes and
+deletions persist across commands, staged-tree refreshes, and `/zone restart`; they shadow later
+staged edits and disappear when the session closes. Use `write` and `edit` to produce durable
+changes. Both repository-relative paths and `/app/...` refer to staged files in the source tools.
+Use `delete_file` for staged deletions. Use `read` before `edit` to obtain staged contents;
+shell reads can show a different private version. Shell results repeat these submission rules.
+The Docker backend exposes no `zone_install` and creates no Nix files.
+
+This backend needs Linux Docker, an image with Python 3, bash, cp, mount, and umount, and permission
+to mount overlayfs with `CAP_SYS_ADMIN` and AppArmor unconfined. The upper is disk-backed with no
+portable hard storage quota. It provides an eval profile with weaker isolation than the Nix VM.
+
+For Deep-SWE, use the [Pier adapter](../../../../evals/pier/README.md). It selects/builds each task
+image through Pier, pins this profile using `PAPER_CONFIG_PATH`, and submits only staged source
+changes to the separate verifier. The adapter sets `autoCommit: true`; interactive sessions retain
+the default approval flow. `PAPER_CONFIG_PATH` points to a trusted JSON profile merged over defaults
+instead of reading the ordinary global/project configuration files.
+
+## Nix setup
 
 Needs Docker with gVisor registered as `runsc` (`sudo runsc install`), and Nix with flakes plus
 KVM (`/dev/kvm`, and your user in the `kvm` group).
@@ -118,7 +160,7 @@ deterministic check that the write container and the zone agree on one tree.
 ## How it fits together
 
 Everything agrees on one tree: the **scratchpad**, a host directory mounted into every sandbox that
-needs it. `write` and `edit` mutate it through `tee`/`mkdir`/`rm` in the write container; `read`,
+needs it. `write`, `edit`, and `delete_file` mutate it through `tee`/`mkdir`/`rm` in the write container; `read`,
 `ls`, `grep` and `find` inspect it from a separate read-only container; the zone gets it read-only
 as the bottom half of its overlay. Without that agreement, the agent would edit a file and then run
 a test against the version it had just replaced.
@@ -149,7 +191,7 @@ disk since staging is reported as a conflict and left alone.
 These are real losses, not rough edges. They follow from the isolation model.
 
 - **The zone cannot change your files.** Formatters, code generators and `npm run build` run, and
-  their output lives in the zone until the session ends. Only `write` and `edit` alter the real
+  their output lives in the zone until the session ends. Only `write`, `edit`, and `delete_file` alter the real
   tree, and only with approval.
 - **The zone has no network.** `npm install` and `git fetch` fail; `zone_install` and `fetch_url`
   are the two ways anything gets in, and both ask you first.
@@ -197,6 +239,7 @@ These are real losses, not rough edges. They follow from the isolation model.
     "env": []                                  // host env var names to forward, by name
   },
   "zone": {
+    "backend": "nix",                         // or "docker" with an image
     "enabled": true,
     "dir": ".pi/zone",                         // the zone's NixOS config, in your project
     "lowerSource": "staged",                   // or "cwd", to see the real tree instead
@@ -241,5 +284,5 @@ false` to turn it off.
 - `config.ts` — configuration loading and merging
 - `smoke.ts` — end-to-end check against real zones, no LLM required
 
-The sandboxes themselves are paper-api's: `createReadZone`, `createWriteZone`, `createNetworkZone`
-and `createExecZone`, plus `scaffoldZoneDir` for the NixOS template.
+The sandboxes themselves are paper-api's: `createReadZone`, `createWriteZone`, `createNetworkZone`,
+`createExecZone`, and `createDockerExecZone`, plus `scaffoldZoneDir` for the NixOS template.

@@ -2,10 +2,12 @@ import { realpath } from "node:fs/promises";
 import path from "node:path";
 
 import {
+	createDockerExecZone,
 	createExecZone,
 	createNetworkZone,
 	createReadZone,
 	createWriteZone,
+	type DockerExecZone,
 	type ExecZone,
 	type NetworkZone,
 	type ReadZone,
@@ -13,6 +15,8 @@ import {
 } from "paper-api";
 
 import type { PaperConfig } from "./config.ts";
+
+export type PaperExecutionZone = ExecZone | DockerExecZone;
 
 /**
  * The zones backing one pi session: one container per capability, plus the VM. Every one of them
@@ -39,8 +43,8 @@ export interface PaperSession {
 	 * `bash` and `!`. Built lazily by `ensureZone`, because a VM costs a `nix build` and a boot,
 	 * and plenty of sessions never run a command at all.
 	 */
-	zone: ExecZone | undefined;
-	ensureZone(onLog?: (line: string) => void): Promise<ExecZone>;
+	zone: PaperExecutionZone | undefined;
+	ensureZone(onLog?: (line: string) => void): Promise<PaperExecutionZone>;
 	/**
 	 * `fetch_url`. Built lazily by `ensureNetZone`, like the VM: it is the one sandbox with
 	 * connectivity, and plenty of sessions never fetch anything at all.
@@ -72,6 +76,7 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 		maxSeedFiles: config.workspace.maxSeedFiles,
 		maxSeedBytes: config.workspace.maxSeedBytes,
 		resources: config.resources,
+		runtime: config.runtime,
 	});
 
 	// The scratchpad is always mount 0, so a workspace-relative path needs no mapping at the call
@@ -81,6 +86,7 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 		read = await createReadZone({
 			paths: [write.scratchDir, ...config.readPaths],
 			resources: config.resources,
+			runtime: config.runtime,
 		});
 	} catch (error) {
 		// The write zone is already up and has already copied the tree; without this its container
@@ -89,8 +95,8 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 		throw error;
 	}
 
-	let zone: ExecZone | undefined;
-	let startingZone: Promise<ExecZone> | undefined;
+	let zone: PaperExecutionZone | undefined;
+	let startingZone: Promise<PaperExecutionZone> | undefined;
 	let net: NetworkZone | undefined;
 	let startingNet: Promise<NetworkZone> | undefined;
 
@@ -111,23 +117,53 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 				);
 			}
 			if (!startingZone) {
-				// Everything but the four knobs this extension owns is a paper-api tuning value,
-				// passed straight through so the defaults live in one place.
-				const { enabled: _enabled, dir, lowerSource, allowInstall: _allowInstall, ...tuning } = config.zone;
-				startingZone = createExecZone({
-					// Tuning goes first because it is whatever was left in an untyped JSON file:
-					// a `zoneDir`, `sessionId` or `onLog` typed into .pi/paper.json must not win
-					// over what this session computed. `onLog` is passed unconditionally for the
-					// same reason — the library calls it, so a string from a config file would
-					// throw mid-build.
-					...tuning,
-					zoneDir: path.resolve(cwd, dir),
-					// The staged tree, not the real one: `bash` has to see the edits the agent
-					// made this turn, and the real tree is deliberately mounted nowhere.
-					lowerSource: lowerSource === "cwd" ? cwd : write.scratchDir,
-					sessionId,
-					onLog,
-				})
+				// Publish the shared startup promise before diff() yields to another tool call.
+				startingZone = Promise.resolve()
+					.then(async () => {
+						// Everything but the four knobs this extension owns is a paper-api tuning value,
+						// passed straight through so the defaults live in one place.
+						const {
+							enabled: _enabled,
+							dir,
+							lowerSource,
+							allowInstall: _allowInstall,
+							backend,
+							image,
+							workspacePath,
+							env,
+							...tuning
+						} = config.zone;
+						if (backend === "docker" && !image) throw new Error("zone.image is required for Docker execution");
+						const lower = lowerSource === "cwd" ? cwd : write.scratchDir;
+						return backend === "docker"
+							? createDockerExecZone({
+									image: image!,
+									initialDeletedPaths: (await write.diff())
+										.filter((entry) => entry.status === "deleted")
+										.map((entry) => entry.path),
+									lowerSource: lower,
+									sessionId,
+									workspacePath,
+									env,
+									resources: config.resources,
+									bootTimeoutMs: tuning.bootTimeoutMs,
+									onLog,
+								})
+							: createExecZone({
+									// Tuning goes first because it is whatever was left in an untyped JSON file:
+									// a `zoneDir`, `sessionId` or `onLog` typed into .pi/paper.json must not win
+									// over what this session computed. `onLog` is passed unconditionally for the
+									// same reason — the library calls it, so a string from a config file would
+									// throw mid-build.
+									...tuning,
+									zoneDir: path.resolve(cwd, dir),
+									// The staged tree, not the real one: `bash` has to see the edits the agent
+									// made this turn, and the real tree is deliberately mounted nowhere.
+									lowerSource: lower,
+									sessionId,
+									onLog,
+								});
+					})
 					.then((created) => {
 						zone = created;
 						return created;
@@ -142,6 +178,7 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 			return net;
 		},
 		async ensureNetZone() {
+			if (!config.network.enabled) throw new Error("Network access is disabled for this session");
 			// Only a ready handle is reusable. A zone closed out from under the session — the
 			// signal handler's `closeAll()`, an idle timeout somebody configures later — would
 			// otherwise be handed back to throw `ZoneClosedError` on every fetch for the rest of
@@ -153,6 +190,7 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 					// the single binary `fetch_url` knows how to read the output of.
 					allowedBinaries: ["wget"],
 					resources: config.resources,
+					runtime: config.runtime,
 				})
 					.then((created) => {
 						net = created;
@@ -196,7 +234,12 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 export type Located = { where: "workspace"; relative: string } | { where: "read"; path: string } | { where: "outside" };
 
 export function locate(session: PaperSession, candidate: string): Located {
-	const absolute = path.resolve(session.cwd, stripAtPrefix(candidate));
+	const stripped = stripAtPrefix(candidate);
+	const guestRoot = session.config.zone.workspacePath ?? "/app";
+	const absolute =
+		session.config.zone.backend === "docker" && (stripped === guestRoot || stripped.startsWith(`${guestRoot}/`))
+			? path.resolve(session.cwd, path.posix.relative(guestRoot, stripped))
+			: path.resolve(session.cwd, stripped);
 	const relative = path.relative(session.cwd, absolute);
 	if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
 		return { where: "workspace", relative: relative === "" ? "." : relative };

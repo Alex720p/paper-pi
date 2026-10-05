@@ -72,6 +72,8 @@
 
 ### Added
 
+- Added a Docker task-image backend to the paper extension and a Pier adapter for Deep-SWE evaluations, preserving separate read/write/network zones and private shell overlays.
+- Added a `delete_file` tool to the paper extension for deletions staged through the write zone.
 - Added built-in Baseten provider support with `BASETEN_API_KEY` authentication and `zai-org/GLM-5.2` as the default model.
 - Added `CredentialSynchronizationError` for credential changes that commit successfully but fail to synchronize local model state.
 - Added chainable `pi.registerMarkdownTransformer()` hooks for display-only transformation of user and assistant Markdown.
@@ -84,6 +86,7 @@
 
 ### Fixed
 
+- Fixed concurrent first Docker shell calls in the paper extension creating multiple exec zones.
 - Fixed project-level nested provider retry settings replacing unmodified global provider retry settings ([#7572](https://github.com/earendil-works/pi/issues/7572)).
 - Fixed inherited GitHub Copilot Grok 4.5 requests to use the supported Responses API ([#7560](https://github.com/earendil-works/pi/issues/7560)).
 - Fixed fullscreen shutdown leaking terminal capability-query replies into the parent shell prompt.

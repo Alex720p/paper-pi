@@ -6,6 +6,9 @@ Use them to measure end-to-end behavior and compare prompts, tools, skills, mode
 
 ## Running evals
 
+For Deep-SWE task-image runs through Pier with the paper zones, see
+[the paper-pi Pier adapter](pier/README.md).
+
 Run from the repository root with a default provider and model:
 
 ```bash
