@@ -86,6 +86,8 @@
 
 ### Fixed
 
+- Fixed paper Deep-SWE trials losing large-file contents or staged changes during exec startup, ignoring Pier deadline overrides, and skipping verification after finalized agent failures.
+- Fixed paper benchmark commit/shutdown errors being reported as success and leaked Docker resources after forced termination. Docker exec now copies staged snapshots into private storage without host filesystem binds.
 - Fixed concurrent first Docker shell calls in the paper extension creating multiple exec zones.
 - Fixed project-level nested provider retry settings replacing unmodified global provider retry settings ([#7572](https://github.com/earendil-works/pi/issues/7572)).
 - Fixed inherited GitHub Copilot Grok 4.5 requests to use the supported Responses API ([#7560](https://github.com/earendil-works/pi/issues/7560)).

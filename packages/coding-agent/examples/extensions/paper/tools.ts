@@ -14,7 +14,7 @@ import {
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 
-import { GUEST_WORKSPACE } from "paper-api";
+import { GUEST_WORKSPACE, HARD_MAX_READ_BYTES } from "paper-api";
 
 import { locate, outsideError, type PaperSession } from "./session.ts";
 
@@ -47,7 +47,9 @@ function readTarget(session: PaperSession, candidate: string): string {
 }
 
 async function readBytes(session: PaperSession, candidate: string): Promise<Buffer> {
-	const result = await session.read.readFileBytes(readTarget(session, candidate));
+	const result = await session.read.readFileBytes(readTarget(session, candidate), { maxBytes: HARD_MAX_READ_BYTES });
+	if (result.truncated)
+		throw new Error(`Cannot read ${candidate} completely: file exceeds ${HARD_MAX_READ_BYTES} bytes`);
 	return Buffer.from(result.data);
 }
 
@@ -100,8 +102,8 @@ export function createPaperReadOps(session: PaperSession): ReadOperations {
  * command would see the file as it was when the VM booted.
  */
 async function stageWrite(session: PaperSession, filePath: string, content: string): Promise<void> {
-	await session.write.writeFile(relativeInWorkspace(session, filePath), content);
-	session.zone?.markLowerDirty();
+	const relative = relativeInWorkspace(session, filePath);
+	await session.mutateStaged(() => session.write.writeFile(relative, content));
 }
 
 export function createPaperWriteOps(session: PaperSession): WriteOperations {
@@ -123,8 +125,8 @@ export function createPaperEditOps(session: PaperSession): EditOperations {
 }
 
 export async function executePaperDelete(session: PaperSession, filePath: string): Promise<void> {
-	await session.write.deleteFile(relativeInWorkspace(session, filePath));
-	session.zone?.markLowerDirty();
+	const relative = relativeInWorkspace(session, filePath);
+	await session.mutateStaged(() => session.write.deleteFile(relative));
 }
 
 export function createPaperLsOps(session: PaperSession): LsOperations {
@@ -375,7 +377,7 @@ export function createPaperBashOps(session: PaperSession): BashOperations {
 			const timeoutMs =
 				options.timeout && options.timeout > 0 ? options.timeout * 1000 : session.config.bash.timeoutMs;
 
-			const zone = await session.ensureZone();
+			const zone = await session.ensureZone(undefined, options.signal);
 			let emitted = 0;
 			let truncated = false;
 			const maxBytes = session.config.bash.maxOutputBytes;

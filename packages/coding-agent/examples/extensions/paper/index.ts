@@ -192,7 +192,8 @@ export default function (pi: ExtensionAPI): void {
 	 * The VM, built on first use. It costs a `nix build` and a boot, and plenty of sessions never
 	 * run a command at all, so nothing here happens at startup.
 	 */
-	async function ensureZone(ctx?: ExtensionContext): Promise<PaperExecutionZone> {
+	async function ensureZone(ctx?: ExtensionContext, signal?: AbortSignal): Promise<PaperExecutionZone> {
+		signal?.throwIfAborted();
 		const active = await ensureSession(ctx);
 		if (active.zone) return active.zone;
 		// Ask the session first when the zone is off: it owns that error, and scaffolding four
@@ -205,7 +206,7 @@ export default function (pi: ExtensionAPI): void {
 		try {
 			const zone = await active.ensureZone((line) => {
 				ctx?.ui.setStatus("paper", accent(`paper: ${line.slice(0, 60)}`));
-			});
+			}, signal);
 			ctx?.ui.setStatus("paper", accent(`paper: exec zone up`));
 			return zone;
 		} catch (error) {
@@ -244,6 +245,7 @@ export default function (pi: ExtensionAPI): void {
 
 	async function reviewStagedEdits(ctx: ExtensionContext, quietWhenEmpty: boolean): Promise<void> {
 		const active = await ensureSession(ctx);
+		await active.flushStaged();
 		const diffs = await active.write.diff();
 
 		if (diffs.length === 0) {
@@ -262,7 +264,9 @@ export default function (pi: ExtensionAPI): void {
 				);
 				return;
 			}
-			reportCommit(ctx, await active.write.commit());
+			const result = await active.write.commit();
+			reportCommit(ctx, result);
+			if (result.conflicts.length > 0) throw new Error("Staged changes conflicted during auto-commit");
 			return;
 		}
 
@@ -351,6 +355,7 @@ export default function (pi: ExtensionAPI): void {
 		try {
 			if (active) {
 				try {
+					await active.flushStaged();
 					const pending = await active.write.diff();
 					if (pending.length > 0 && active.config.autoCommit) {
 						const result = await active.write.commit();
@@ -470,7 +475,7 @@ export default function (pi: ExtensionAPI): void {
 		async execute(id, params, signal, onUpdate, ctx) {
 			// Build the zone here rather than inside the operations, so its `nix build` and boot
 			// get the status line and the scaffolding prompt.
-			await ensureZone(ctx);
+			await ensureZone(ctx, signal);
 			const active = await ensureSession(ctx);
 			const tool = createBashTool(resolveCwd(ctx), { operations: createPaperBashOps(active) });
 			const result = await tool.execute(id, params, signal, onUpdate);

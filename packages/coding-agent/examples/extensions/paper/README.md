@@ -94,7 +94,9 @@ without filesystem mounts. `runtime` selects the read/write/network runtime; Doc
 `fetch_url` is removed from the active tool set and no network container starts.
 
 The image supplies the toolchain and dependencies. Paper copies its repository into a private
-Docker volume and places staged source edits beneath a real overlayfs upper. Shell writes and
+Docker volume and places copied staged source snapshots beneath a real overlayfs upper. Exec has
+no host filesystem bind mounts; remounting or modifying a snapshot affects only the private volume.
+Staged writes and deletions wait for initial exec setup, then refresh its lower layer. Shell writes and
 deletions persist across commands, staged-tree refreshes, and `/zone restart`; they shadow later
 staged edits and disappear when the session closes. Use `write` and `edit` to produce durable
 changes. Both repository-relative paths and `/app/...` refer to staged files in the source tools.
@@ -159,10 +161,10 @@ deterministic check that the write container and the zone agree on one tree.
 
 ## How it fits together
 
-Everything agrees on one tree: the **scratchpad**, a host directory mounted into every sandbox that
-needs it. `write`, `edit`, and `delete_file` mutate it through `tee`/`mkdir`/`rm` in the write container; `read`,
-`ls`, `grep` and `find` inspect it from a separate read-only container; the zone gets it read-only
-as the bottom half of its overlay. Without that agreement, the agent would edit a file and then run
+Everything agrees on one tree: the **scratchpad**, a host directory mounted into the file containers.
+`write`, `edit`, and `delete_file` mutate it through `tee`/`mkdir`/`rm` in the write container; `read`,
+`ls`, `grep` and `find` inspect it from a separate read-only container. Nix gets a read-only share;
+Docker gets copied snapshots as the bottom half of its overlay. Without that agreement, the agent would edit a file and then run
 a test against the version it had just replaced.
 
 ```
@@ -185,6 +187,9 @@ repo would defeat the approval gate it exists to enforce.
 `write` and `edit` report `staged`, not `wrote`. Apply them with `/paper`, or answer the prompt at
 the end of each turn. Nothing reaches the real tree until you say so, and a file that changed on
 disk since staging is reported as a conflict and left alone.
+
+Source reads and edits request complete files up to 32 MiB. Larger or truncated inputs fail before
+an edit writes anything. The read tool still pages its displayed output.
 
 ## What this costs you
 

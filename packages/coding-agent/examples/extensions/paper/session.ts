@@ -24,7 +24,8 @@ export type PaperExecutionZone = ExecZone | DockerExecZone;
  *
  * The two file containers bind-mount the same host scratchpad, with opposite postures —
  * read-write for the zone that mutates it, read-only for the zone that inspects it — and the
- * execution zone gets it a third time, read-only, as the lower layer of its overlay. The network
+ * Nix execution zone gets a read-only share; Docker exec gets copied snapshots in a private
+ * volume with no host binds. Both place it beneath a private overlay upper. The network
  * container is the odd one out: it mounts nothing at all, which is what buys it connectivity.
  *
  * The scratchpad, rather than the real tree, is what everything agrees on because approval is
@@ -44,7 +45,10 @@ export interface PaperSession {
 	 * and plenty of sessions never run a command at all.
 	 */
 	zone: PaperExecutionZone | undefined;
-	ensureZone(onLog?: (line: string) => void): Promise<PaperExecutionZone>;
+	ensureZone(onLog?: (line: string) => void, signal?: AbortSignal): Promise<PaperExecutionZone>;
+	/** Serialize staged mutations with the initial exec snapshot. */
+	mutateStaged(work: () => Promise<void>): Promise<void>;
+	flushStaged(): Promise<void>;
 	/**
 	 * `fetch_url`. Built lazily by `ensureNetZone`, like the VM: it is the one sandbox with
 	 * connectivity, and plenty of sessions never fetch anything at all.
@@ -99,6 +103,16 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 	let startingZone: Promise<PaperExecutionZone> | undefined;
 	let net: NetworkZone | undefined;
 	let startingNet: Promise<NetworkZone> | undefined;
+	let stagedQueue: Promise<void> = Promise.resolve();
+	let closed = false;
+	const exclusive = <T>(work: () => Promise<T>): Promise<T> => {
+		const result = stagedQueue.then(work);
+		stagedQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	};
 
 	const session: PaperSession = {
 		cwd,
@@ -108,7 +122,17 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 		get zone() {
 			return zone;
 		},
-		async ensureZone(onLog) {
+		mutateStaged(work) {
+			return exclusive(async () => {
+				if (closed) throw new Error("Paper session is closed");
+				await work();
+				zone?.markLowerDirty();
+			});
+		},
+		flushStaged: () => stagedQueue,
+		async ensureZone(onLog, signal) {
+			signal?.throwIfAborted();
+			if (closed) throw new Error("Paper session is closed");
 			if (zone) return zone;
 			if (!config.zone.enabled) {
 				throw new Error(
@@ -118,59 +142,61 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 			}
 			if (!startingZone) {
 				// Publish the shared startup promise before diff() yields to another tool call.
-				startingZone = Promise.resolve()
-					.then(async () => {
-						// Everything but the four knobs this extension owns is a paper-api tuning value,
-						// passed straight through so the defaults live in one place.
-						const {
-							enabled: _enabled,
-							dir,
-							lowerSource,
-							allowInstall: _allowInstall,
-							backend,
-							image,
-							workspacePath,
-							env,
-							...tuning
-						} = config.zone;
-						if (backend === "docker" && !image) throw new Error("zone.image is required for Docker execution");
-						const lower = lowerSource === "cwd" ? cwd : write.scratchDir;
-						return backend === "docker"
-							? createDockerExecZone({
-									image: image!,
-									initialDeletedPaths: (await write.diff())
-										.filter((entry) => entry.status === "deleted")
-										.map((entry) => entry.path),
-									lowerSource: lower,
-									sessionId,
-									workspacePath,
-									env,
-									resources: config.resources,
-									bootTimeoutMs: tuning.bootTimeoutMs,
-									onLog,
-								})
-							: createExecZone({
-									// Tuning goes first because it is whatever was left in an untyped JSON file:
-									// a `zoneDir`, `sessionId` or `onLog` typed into .pi/paper.json must not win
-									// over what this session computed. `onLog` is passed unconditionally for the
-									// same reason — the library calls it, so a string from a config file would
-									// throw mid-build.
-									...tuning,
-									zoneDir: path.resolve(cwd, dir),
-									// The staged tree, not the real one: `bash` has to see the edits the agent
-									// made this turn, and the real tree is deliberately mounted nowhere.
-									lowerSource: lower,
-									sessionId,
-									onLog,
-								});
-					})
-					.then((created) => {
-						zone = created;
-						return created;
-					})
-					.finally(() => {
-						startingZone = undefined;
-					});
+				startingZone = exclusive(async () => {
+					signal?.throwIfAborted();
+					// Everything but the four knobs this extension owns is a paper-api tuning value,
+					// passed straight through so the defaults live in one place.
+					const {
+						enabled: _enabled,
+						dir,
+						lowerSource,
+						allowInstall: _allowInstall,
+						backend,
+						image,
+						workspacePath,
+						env,
+						...tuning
+					} = config.zone;
+					if (backend === "docker" && !image) throw new Error("zone.image is required for Docker execution");
+					const lower = lowerSource === "cwd" ? cwd : write.scratchDir;
+					const created = await (backend === "docker"
+						? createDockerExecZone({
+								image: image!,
+								initialDeletedPaths: (await write.diff())
+									.filter((entry) => entry.status === "deleted")
+									.map((entry) => entry.path),
+								lowerSource: lower,
+								sessionId,
+								workspacePath,
+								env,
+								resources: config.resources,
+								bootTimeoutMs: tuning.bootTimeoutMs,
+								onLog,
+								signal,
+							})
+						: createExecZone({
+								// Tuning goes first because it is whatever was left in an untyped JSON file:
+								// a `zoneDir`, `sessionId` or `onLog` typed into .pi/paper.json must not win
+								// over what this session computed. `onLog` is passed unconditionally for the
+								// same reason — the library calls it, so a string from a config file would
+								// throw mid-build.
+								...tuning,
+								zoneDir: path.resolve(cwd, dir),
+								// The staged tree, not the real one: `bash` has to see the edits the agent
+								// made this turn, and the real tree is deliberately mounted nowhere.
+								lowerSource: lower,
+								sessionId,
+								onLog,
+							}));
+					if (signal?.aborted) {
+						await created.close();
+						signal.throwIfAborted();
+					}
+					zone = created;
+					return created;
+				}).finally(() => {
+					startingZone = undefined;
+				});
 			}
 			return startingZone;
 		},
@@ -212,6 +238,8 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 			}),
 		),
 		close: async () => {
+			await stagedQueue;
+			closed = true;
 			// Scoped, not `closeAll()`: that tore down every zone the process had registered,
 			// including any a host application had opened alongside this session.
 			//
@@ -223,7 +251,13 @@ export async function openPaperSession(cwd: string, config: PaperConfig, session
 				? zone.close()
 				: (startingZone?.then((created) => created.close()) ?? Promise.resolve());
 			const closingNet = net ? net.close() : (startingNet?.then((created) => created.close()) ?? Promise.resolve());
-			await Promise.allSettled([read.close(), write.close(), closingZone, closingNet]);
+			const results = await Promise.allSettled([read.close(), write.close(), closingZone, closingNet]);
+			const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+			if (failures.length > 0)
+				throw new AggregateError(
+					failures.map((result) => result.reason),
+					"Paper cleanup failed",
+				);
 		},
 	};
 

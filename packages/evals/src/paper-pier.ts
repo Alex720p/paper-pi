@@ -26,7 +26,6 @@ export interface PaperPierInput {
 	instruction: string;
 	provider: string;
 	model: string;
-	timeoutMs: number;
 	memoryBytes: number;
 	cpus: number;
 	allowInternet: boolean;
@@ -86,6 +85,11 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 	const spans: Array<{ toolCallId: string; tool: string; durationMs: number; isError: boolean }> = [];
 	const starts = new Map<string, number>();
 	const controller = new AbortController();
+	let error: unknown;
+	let failureKind: "agent" | "infrastructure" | undefined;
+	let agentStarted = false;
+	let timedOut = false;
+	let submissionReady = false;
 	let aborting: Promise<void> | undefined;
 	let phase = "setup";
 	let lastActivity = performance.now();
@@ -102,6 +106,14 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 	}, 15_000);
 	const abort = () => {
 		log("Aborting trial");
+		timedOut = true;
+		controller.abort();
+		aborting ??= session?.abort();
+	};
+	const infrastructureError = (cause: unknown) => {
+		error = cause;
+		failureKind = "infrastructure";
+		log(`Infrastructure error: ${cause instanceof Error ? cause.message : String(cause)}`);
 		controller.abort();
 		aborting ??= session?.abort();
 	};
@@ -109,8 +121,6 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 	process.on("SIGINT", abort);
 	// Pier cancellation uses this signal so paper-api's process-exit hooks cannot race submission.
 	process.on("SIGUSR1", abort);
-	const timer = setTimeout(abort, input.timeoutMs);
-	let error: unknown;
 	let setupMs = 0;
 	try {
 		fake = input.fakeSteps ? await createFakeModelRuntime() : undefined;
@@ -162,7 +172,8 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 			})
 		).session;
 		// Programmatic sessions need explicit startup binding for session_start hooks.
-		await session.bindExtensions({ mode: "print", onError: (cause) => log(`Extension error: ${cause.error}`) });
+		await session.bindExtensions({ mode: "print", onError: (cause) => infrastructureError(new Error(cause.error)) });
+		if (failureKind === "infrastructure") throw error;
 		const extensions = session.extensionRunner.getExtensionPaths();
 		if (extensions.length !== 1 || !extensions[0]?.startsWith(PAPER)) {
 			throw new Error(`Expected only paper extension, loaded: ${extensions.join(", ")}`);
@@ -214,6 +225,7 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 		controller.signal.throwIfAborted();
 		phase = "waiting for model";
 		log("Sending task prompt");
+		agentStarted = true;
 		if (fake && input.fakeSteps) {
 			driver = new FakeSessionDriver({
 				session,
@@ -233,34 +245,37 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 			if (last?.stopReason !== "stop") throw new Error(last?.errorMessage ?? "Agent did not finish normally");
 		}
 	} catch (cause) {
-		error = cause;
+		error ??= cause;
+		failureKind ??= agentStarted ? "agent" : "infrastructure";
 		log(`Trial error: ${cause instanceof Error ? cause.message : String(cause)}`);
 	} finally {
-		clearTimeout(timer);
 		clearInterval(heartbeat);
-		process.off("SIGTERM", abort);
-		process.off("SIGINT", abort);
-		process.off("SIGUSR1", abort);
 		try {
 			await aborting;
 			await driver?.dispose();
 		} catch (cause) {
-			error ??= cause;
+			infrastructureError(cause);
 		}
 		try {
 			// Emit shutdown before dispose: paper commits remaining staged edits and closes its zones.
 			await session?.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		} catch (cause) {
-			error ??= cause;
+			infrastructureError(cause);
 		}
+		submissionReady = Boolean(session && agentStarted && failureKind !== "infrastructure");
+		process.off("SIGTERM", abort);
+		process.off("SIGINT", abort);
+		process.off("SIGUSR1", abort);
 		const stats = session?.getSessionStats();
-		const status = controller.signal.aborted ? "timeout" : error ? "error" : "completed";
+		const status = failureKind === "infrastructure" ? "error" : timedOut ? "timeout" : error ? "error" : "completed";
 		await writeFile(
 			join(input.logsDir, "paper-result.json"),
 			JSON.stringify(
 				{
 					processId: process.pid,
 					status,
+					failureKind,
+					submissionReady,
 					error: error instanceof Error ? error.message : error === undefined ? undefined : String(error),
 					image: input.image,
 					provider: model?.provider ?? input.provider,

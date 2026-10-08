@@ -94,6 +94,9 @@ network container is created. A task that permits networking can use `fetch_url`
 still have no network. Pier's submission container and separate verifier are additional harness
 containers, outside paper's four zones.
 Concurrent first shell calls share the same exec startup and private filesystem.
+Staged writes and deletions are serialized with initial startup. Exec mounts only a private
+Docker volume; staged snapshots are copied through Docker's archive API. Shell remounts and
+snapshot writes cannot reach the host scratchpad or the submitted source checkout.
 
 The task image supplies its toolchain, dependencies, and Git checkout. The host seed is a Git
 archive of the task's `HEAD`; the read/write staging view excludes `.git`, `node_modules`, `dist`,
@@ -103,10 +106,12 @@ Repository-relative paths and `/app/...` paths address the staged source tools.
 Shell writes and deletion whiteouts stay in exec's private overlay upper. They persist between
 commands, lower refreshes, and restarts, and can shadow later staged edits. The agent must use
 `write` / `edit` for submitted source changes; shell `git commit`, formatters, and code generation
-cannot submit anything. At completion or graceful timeout, the trusted adapter applies staged
+cannot submit anything. At completion, agent failure, or graceful timeout, the trusted adapter applies staged
 changes to its disposable source checkout, makes a binary Git patch, and applies and commits that
 patch in Pier's submission environment. Pier's task-defined collection hook then transfers it to
 the pristine verifier. The agent receives neither held-out tests nor the reference solution.
+Finalized agent failures use Pier's `NonZeroAgentExitCodeError` so their partial patch is verified.
+Setup, commit, shutdown, and submission failures are infrastructure errors and are not scored.
 
 Shell results remind the agent to submit source through `write` / `edit` / `delete_file`. Before `edit`, use
 `read` to obtain the staged contents: shell reads can show a different private version. Run
@@ -121,12 +126,14 @@ context files cannot override this profile. The existing interactive Nix default
 
 Each trial records:
 
-- `agent/paper-result.json`: status, immutable image ID, selected model, session stats, estimated
+- `agent/paper-result.json`: status, `failureKind` (`agent` or `infrastructure` on failure),
+  `submissionReady`, immutable image ID, selected model, session stats, estimated
   cost availability, effective thinking/output limits, setup/agent timing, and per-tool durations
   (including first-use startup).
 - `agent/runner-stdout.txt`: live thinking, text, tool arguments, tool start/end markers, and a
   heartbeat every 15 seconds with the current phase and time since the last activity.
 - `agent/runner-stderr.txt`: runner diagnostics, persisted as they happen, including on interruption.
+- `agent/runner-process.json`: child PID recorded at spawn, and whether forced termination was required.
 - `agent/sessions/*.jsonl` and `agent/transcripts/*.jsonl`: native Pi session and paper transcript.
 - `agent/model.patch`: staged source changes actually submitted; no private shell changes.
 - Pier's `result.json`: token/cost context, paper metadata, repository revisions and dirty flags,
@@ -136,14 +143,20 @@ Watch a running trial with `tail -n 20 -f <trial-directory>/agent/runner-stdout.
 Session JSONL saves responses when they finish; use the runner log to see partial responses.
 
 CPU, memory, and PID limits apply **per zone**; the entire trial can use more than one container's
-limit. Pier enforces its agent/verifier deadlines; shell calls default to 120 seconds and accept
+limit. Pier alone enforces its agent/verifier deadlines, including overrides and multipliers;
+shell calls default to 120 seconds and accept
 the bash tool's `timeout` override. Docker volume storage has no portable hard quota; requested
 storage is recorded with `storageLimitEnforced: false`. The image must include Python 3, bash,
 cp, mount, and umount. Staged symlinks are unsupported.
+Source read/edit inputs must fit within 32 MiB and be complete; oversized reads fail before edits.
 
 The exec container needs `CAP_SYS_ADMIN` and AppArmor unconfined to mount overlayfs. This profile
 measures paper's zone/tool design with Docker; it has weaker isolation than the Nix VM. Closing
-a session removes the exec container and its private volume. `paper-api.reapOrphans()` reclaims
+a session removes the exec container and its private volume. Cancellation during exec setup removes
+partial resources. Pier signals the runner with `SIGUSR1` and allows 15 seconds to finalize;
+after child exit it removes only paper containers and exec volumes labelled with that child's PID.
+A forced kill or missing result is an infrastructure failure and skips submission and verification.
+`paper-api.reapOrphans()` reclaims
 managed resources whose host owner died in a hard crash.
 
 ## Deterministic integration check
@@ -151,12 +164,13 @@ managed resources whose host owner died in a hard crash.
 With the venv active and Docker reachable:
 
 ```sh
-PAPER_PIER_INTEGRATION=1 python packages/evals/pier/test_paper_agent.py
+PAPER_PIER_INTEGRATION=1 python -m unittest discover -s packages/evals/pier -p 'test_paper_agent*.py' -v
 ```
 
 This builds a tiny fixture, drives real Pi tools using the faux provider, and expects reward 1
-from a separate verifier in both completion and timeout cases. It checks that private shell edits
+from a separate verifier in completion, agent-error, timeout, and extended-deadline cases. It checks that private shell edits
 are excluded, task-local config cannot override the profile, and containers/private volumes are
-removed. `PAPER_PIER_TEST_BASE` can select an existing Debian-derived image
+removed. Adapter regressions also check infrastructure failures and force-kill cleanup that
+preserves resources owned by another process. `PAPER_PIER_TEST_BASE` can select an existing Debian-derived image
 with Python, bash, and Git instead of installing Git in `python:3.12-slim`.
 These are infrastructure checks; faux usage statistics are synthetic and are not model scores.
