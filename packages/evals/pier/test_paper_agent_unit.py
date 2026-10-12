@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 from pier.models.agent.context import AgentContext
 from pier.agents.installed.base import NonZeroAgentExitCodeError
-from paper_agent import HostCommandError, PaperAgent, cleanup_runner_resources, host_command
+from paper_agent import HostCommandError, InferenceUnavailableError, PaperAgent, cleanup_runner_resources, host_command
 
 
 class PaperAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -108,6 +108,24 @@ class PaperAdapterTests(unittest.IsolatedAsyncioTestCase):
         agent, _, error = await self._trial({"status": "timeout", "submissionReady": True}, asyncio.CancelledError())
         agent._submit.assert_awaited_once()
         self.assertIsInstance(error, asyncio.CancelledError)
+
+    async def test_disconnect_preserves_partial_submission_and_distinct_error(self):
+        agent, context, error = await self._trial({
+            "status": "error", "failureKind": "agent", "submissionReady": True,
+            "inferenceUnavailable": True, "error": "Endpoint unreachable",
+        }, HostCommandError("disconnected"))
+        agent._submit.assert_awaited_once()
+        self.assertIsInstance(error, InferenceUnavailableError)
+        self.assertTrue(context.metadata["paper"]["inferenceUnavailable"])
+
+    async def test_disconnect_with_failed_finalization_remains_unscored(self):
+        agent, context, error = await self._trial({
+            "status": "error", "failureKind": "infrastructure", "submissionReady": False,
+            "inferenceUnavailable": True,
+        }, HostCommandError("disconnected"))
+        agent._submit.assert_not_awaited()
+        self.assertNotIsInstance(error, NonZeroAgentExitCodeError)
+        self.assertTrue(context.metadata["paper"]["inferenceUnavailable"])
 
     async def test_infrastructure_failure_is_not_submitted(self):
         for result, forced in ((None, False), ({"status": "error", "failureKind": "infrastructure", "submissionReady": False}, False),

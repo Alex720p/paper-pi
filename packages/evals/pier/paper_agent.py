@@ -22,6 +22,10 @@ class HostCommandError(RuntimeError):
     """A completed host process failed; infrastructure callers retain RuntimeError semantics."""
 
 
+class InferenceUnavailableError(NonZeroAgentExitCodeError):
+    """Save partial staged work, then pause the job for reconnection."""
+
+
 CANCELLATION_GRACE_SECONDS = 15
 
 
@@ -268,7 +272,8 @@ class PaperAgent(BaseAgent):
             else:
                 if isinstance(error, HostCommandError) or result.get("failureKind") == "agent":
                     if not isinstance(error, asyncio.CancelledError):
-                        error = NonZeroAgentExitCodeError(result.get("error") or str(error))
+                        exception = InferenceUnavailableError if result.get("inferenceUnavailable") else NonZeroAgentExitCodeError
+                        error = exception(result.get("error") or str(error))
         result_path.write_text(json.dumps(result, indent=2))
         stats = result.get("stats") or {}
         tokens = stats.get("tokens") or {}

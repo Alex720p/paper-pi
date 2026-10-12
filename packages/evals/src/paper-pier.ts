@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { FakeSessionDriver, type FakeToolCallRequest } from "./fake-session/driver.ts";
 import { createFakeModelRuntime } from "./fake-session/model.ts";
+import { InferenceMonitor, isInferenceTransportError } from "./inference-monitor.ts";
 
 const PAPER = fileURLToPath(new URL("../../coding-agent/examples/extensions/paper", import.meta.url));
 
@@ -82,6 +83,8 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 	let model: Model<Api> | undefined;
 	let session: AgentSession | undefined;
 	let driver: FakeSessionDriver | undefined;
+	let monitor: InferenceMonitor | undefined;
+	let inferenceUnavailable = false;
 	const spans: Array<{ toolCallId: string; tool: string; durationMs: number; isError: boolean }> = [];
 	const starts = new Map<string, number>();
 	const controller = new AbortController();
@@ -133,6 +136,23 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 			}));
 		model = fake?.model ?? modelRuntime.getModel(input.provider, input.model);
 		if (!model) throw new Error(`Model not found: ${input.provider}/${input.model}`);
+		if (!fake) {
+			// Resolve the same host endpoint as inference, including auth-provider overrides.
+			const auth = await modelRuntime.getAuth(model, { signal: controller.signal });
+			if (!auth) throw new Error(`Provider is not configured: ${model.provider}`);
+			monitor = new InferenceMonitor(
+				auth.auth.baseUrl ?? model.baseUrl,
+				(cause) => {
+					inferenceUnavailable = true;
+					error = cause;
+					failureKind ??= agentStarted ? "agent" : "infrastructure";
+					log(cause.message);
+					controller.abort();
+					aborting ??= session?.abort();
+				},
+				{ signal: controller.signal },
+			);
+		}
 		if (input.maxOutputTokens !== undefined) {
 			if (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens < 1) {
 				throw new Error("maxOutputTokens must be a positive integer");
@@ -182,11 +202,14 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 		log(`Model ready: thinking=${session.thinkingLevel}; maxOutputTokens=${model.maxTokens}`);
 		session.subscribe((event) => {
 			lastActivity = performance.now();
+			if (event.type === "turn_start") monitor?.setActive(true);
+			if (event.type === "message_end" && event.message.role === "assistant") monitor?.setActive(false);
 			if (event.type === "message_start" && event.message.role === "assistant") {
 				phase = "waiting for model";
 				log("Assistant response started");
 			}
 			if (event.type === "message_update") {
+				monitor?.reportActivity();
 				const delta = event.assistantMessageEvent;
 				if (delta.type === "thinking_start" || delta.type === "text_start" || delta.type === "toolcall_start") {
 					phase = delta.type.replace("_start", "");
@@ -225,8 +248,8 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 		controller.signal.throwIfAborted();
 		phase = "waiting for model";
 		log("Sending task prompt");
-		agentStarted = true;
 		if (fake && input.fakeSteps) {
+			agentStarted = true;
 			driver = new FakeSessionDriver({
 				session,
 				faux: fake.faux,
@@ -240,16 +263,26 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 			}
 			await driver.finish("Infrastructure validation complete.");
 		} else {
+			await monitor?.confirmConnection();
+			controller.signal.throwIfAborted();
+			agentStarted = true;
+			monitor?.setActive(true);
+			monitor?.start();
 			await session.prompt(input.instruction);
 			const last = [...session.messages].reverse().find((message) => message.role === "assistant");
 			if (last?.stopReason !== "stop") throw new Error(last?.errorMessage ?? "Agent did not finish normally");
 		}
 	} catch (cause) {
+		monitor?.setActive(false);
+		if (!inferenceUnavailable && !timedOut && failureKind !== "infrastructure" && isInferenceTransportError(cause)) {
+			await monitor?.confirmConnection();
+		}
 		error ??= cause;
 		failureKind ??= agentStarted ? "agent" : "infrastructure";
 		log(`Trial error: ${cause instanceof Error ? cause.message : String(cause)}`);
 	} finally {
 		clearInterval(heartbeat);
+		await monitor?.stop();
 		try {
 			await aborting;
 			await driver?.dispose();
@@ -275,6 +308,7 @@ export async function runPaperPier(input: PaperPierInput): Promise<void> {
 					processId: process.pid,
 					status,
 					failureKind,
+					inferenceUnavailable,
 					submissionReady,
 					error: error instanceof Error ? error.message : error === undefined ? undefined : String(error),
 					image: input.image,

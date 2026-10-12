@@ -1,11 +1,12 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { build } from "esbuild";
 
-const outputPath = join(tmpdir(), "pi-browser-smoke.js");
-const agentTreeshakeOutputPath = join(tmpdir(), "pi-agent-treeshake-smoke.js");
-const errorLogPath = join(tmpdir(), "pi-browser-smoke-errors.log");
+const outputDir = mkdtempSync(join(tmpdir(), "pi-browser-smoke-"));
+const outputPath = join(outputDir, "pi-browser-smoke.js");
+const agentTreeshakeOutputPath = join(outputDir, "pi-agent-treeshake-smoke.js");
+const errorLogPath = join(outputDir, "pi-browser-smoke-errors.log");
 const generatedCatalogDataDir = join(process.cwd(), "packages/ai/src/providers/data");
 
 // Fresh checkouts do not materialize provider JSON until model data is hydrated.
@@ -107,6 +108,7 @@ try {
 		);
 	}
 
+	rmSync(outputDir, { recursive: true });
 	process.exit(0);
 } catch (error) {
 	let detailedErrors = "";

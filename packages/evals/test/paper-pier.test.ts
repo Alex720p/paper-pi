@@ -3,7 +3,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as Connectivity from "../src/inference-monitor.ts";
 import { type PaperPierInput, runPaperPier } from "../src/paper-pier.ts";
+
+vi.mock("../src/inference-monitor.ts", async (importOriginal) => {
+	const original = await importOriginal<typeof Connectivity>();
+	return {
+		...original,
+		InferenceMonitor: class extends original.InferenceMonitor {
+			constructor(...args: ConstructorParameters<typeof original.InferenceMonitor>) {
+				super(args[0], args[1], { ...args[2], intervalMs: 1, timeoutMs: 10 });
+			}
+		},
+	};
+});
 
 const runner = vi.hoisted(() => ({
 	onError: undefined as ((cause: { error: string }) => void) | undefined,
@@ -18,9 +31,11 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 	initTheme: vi.fn(),
 	ModelRuntime: {
 		create: async () => ({
+			getAuth: async () => ({ auth: {} }),
 			getModel: () => ({
 				provider: "fixture",
 				id: "fixture",
+				baseUrl: "http://fixture.invalid/v1",
 				reasoning: false,
 				maxTokens: 8192,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -75,12 +90,15 @@ describe("paper benchmark finalization", () => {
 			allowInternet: false,
 			env: {},
 		};
+		vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 200 })));
 		runner.failBind = false;
 		runner.failShutdown = false;
 		runner.prompt.mockReset().mockResolvedValue(undefined);
 		runner.abort.mockClear();
+		runner.abort.mockResolvedValue(undefined);
 	});
 	afterEach(async () => {
+		vi.unstubAllGlobals();
 		await rm(directory, { recursive: true, force: true });
 		if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
@@ -112,5 +130,51 @@ describe("paper benchmark finalization", () => {
 		});
 		await expect(runPaperPier(input)).rejects.toThrow("aborted");
 		expect(await result()).toMatchObject({ status: "timeout", submissionReady: true });
+	});
+	it("aborts hanging inference and finalizes the partial submission on disconnect", async () => {
+		const fetch = vi
+			.fn()
+			.mockResolvedValueOnce(new Response(null, { status: 200 }))
+			.mockRejectedValue(new TypeError("fetch failed"));
+		vi.stubGlobal("fetch", fetch);
+		let release: (() => void) | undefined;
+		runner.prompt.mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					release = resolve;
+				}),
+		);
+		runner.abort.mockImplementation(async () => {
+			release?.();
+		});
+		await expect(runPaperPier(input)).rejects.toThrow("three consecutive probes");
+		expect(fetch).toHaveBeenCalledTimes(4);
+		expect(runner.abort).toHaveBeenCalledTimes(1);
+		expect(await result()).toMatchObject({ failureKind: "agent", submissionReady: true, inferenceUnavailable: true });
+	});
+	it("confirms connectivity after an actual inference transport error", async () => {
+		const fetch = vi
+			.fn()
+			.mockResolvedValueOnce(new Response(null, { status: 200 }))
+			.mockRejectedValue(new TypeError("fetch failed"));
+		vi.stubGlobal("fetch", fetch);
+		runner.prompt.mockRejectedValue(new Error("Connection error."));
+		await expect(runPaperPier(input)).rejects.toThrow("three consecutive probes");
+		expect(await result()).toMatchObject({ inferenceUnavailable: true, submissionReady: true });
+	});
+	it("does not classify an inference failure as a disconnect when the endpoint is reachable", async () => {
+		runner.prompt.mockRejectedValue(new Error("Connection error."));
+		await expect(runPaperPier(input)).rejects.toThrow("Connection error.");
+		expect(await result()).toMatchObject({ inferenceUnavailable: false, failureKind: "agent" });
+	});
+	it("pauses before inference when the endpoint is already unreachable", async () => {
+		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
+		await expect(runPaperPier(input)).rejects.toThrow("three consecutive probes");
+		expect(runner.prompt).not.toHaveBeenCalled();
+		expect(await result()).toMatchObject({
+			inferenceUnavailable: true,
+			failureKind: "infrastructure",
+			submissionReady: false,
+		});
 	});
 });

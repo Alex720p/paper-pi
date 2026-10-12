@@ -41,13 +41,12 @@ From the paper-pi checkout:
 
 ```sh
 export PYTHONPATH="$PWD/packages/evals/pier${PYTHONPATH:+:$PYTHONPATH}"
-pier run -p /path/to/deep-swe/tasks/etree-xml-diff-patch \
-  --agent-import-path paper_agent:PaperAgent \
-  --model openai/gpt-5.5 --env docker --n-concurrent 1 \
+python -m paper_job run -p /path/to/deep-swe/tasks/etree-xml-diff-patch \
+  --model openai/gpt-5.5 --n-concurrent 1 \
   --jobs-dir packages/evals/.eval/deep-swe --max-retries 0
 ```
 
-For the corpus, change `-p` to `/path/to/deep-swe/tasks`. Use Pier's `--n-tasks` and `--sample-seed`
+For the corpus, change `-p` to `/path/to/deep-swe/tasks`. Use `--n-tasks` and `--sample-seed`
 for a subset. This adapter runs the paper arm only; it creates no paired baseline. Execution is
 currently local Linux Docker only. MCP/skills tasks fail explicitly instead of running without
 their required tools. Thinking defaults to `high` for models registered with `reasoning: true`,
@@ -78,6 +77,74 @@ do not go through the network zone.
 `--ak max_output_tokens=32768` optionally caps each response, including reasoning. Without it,
 the catalog's `maxTokens` applies. A cap can truncate reasoning or tool arguments and fail a task;
 it is a limit rather than a guarantee the model will finish its response.
+
+The launcher defaults to one concurrent trial and no automatic retries. `--config job.json`
+(or YAML) accepts Pier's native `JobConfig`, including timeout multipliers and resource overrides;
+set its agent import to `paper_agent:PaperAgent`. CLI options override the corresponding saved
+config fields. The launcher resolves dataset sampling into explicit absolute task paths before
+starting, so reconnecting cannot resample the corpus. Existing direct `pier run` commands remain
+available, but the paper launcher adds automatic job pause and optional pruning hooks.
+
+## VPN expiry and resume
+
+Run long jobs inside `tmux` to keep them alive when the SSH connection closes:
+
+```sh
+tmux new -s paper-eval
+. packages/evals/pier/.venv/bin/activate
+export PYTHONPATH="$PWD/packages/evals/pier${PYTHONPATH:+:$PYTHONPATH}"
+python -m paper_job run -p /path/to/deep-swe/tasks \
+  --model epfl/zai-org/GLM-5.3-Flash --ak thinking_level=high \
+  --jobs-dir packages/evals/.eval/deep-swe --prune-docker-cache
+```
+
+Detach with Ctrl-b, then d. After reconnecting SSH, use `tmux attach -t paper-eval`.
+The launcher prints the job directory before execution. Keep that directory and the original
+task paths. When inference becomes unreachable, the runner saves staged work, logs, and a partial
+patch, closes zones, and pauses the job after the trial result and verification finish. The
+launcher exits with status 75 and prints a resume command. Reconnect the VPN, restore host model
+credentials as needed, then run from the paper-pi checkout:
+
+```sh
+. packages/evals/pier/.venv/bin/activate
+export PYTHONPATH="$PWD/packages/evals/pier${PYTHONPATH:+:$PYTHONPATH}"
+python -m paper_job resume packages/evals/.eval/deep-swe/<job-name>
+```
+
+Resume uses the saved task selection, model ID, agent options, limits, concurrency, and pruning
+setting. It restarts the interrupted task **from the beginning**, with a fresh conversation and
+workspace. Completed graded tasks are skipped, including reward zero, graded timeouts, and
+finalized ordinary agent failures. Infrastructure failures and attempts without verification
+are also retried. Their complete trial directories are moved under `<job-dir>/.interrupted/`
+before Pier scans completed results, preserving logs, patches, and previous verifier output.
+The same command handles a manual interruption or process crash. Concurrent launches/resumes
+of the same job are rejected. Jobs created with the earlier documented `pier run` command can
+also be resumed if they use this agent, local Docker, and `max_retries = 0`.
+
+The connectivity monitor runs on the host, where paper-pi makes its LLM requests. Before the
+prompt and while inference is active, it probes the effective model endpoint's `/models` route
+without generating tokens. A probe times out after 20 seconds; probes are spaced 30 seconds apart,
+and three consecutive failures confirm loss of access. Streamed model activity resets failures.
+HTTP authentication errors, unsupported routes, and rate limits establish reachability and do
+not trigger VPN recovery; transport failures and HTTP 502/503/504 count as unavailable. Actual
+inference transport errors also trigger bounded connectivity confirmation. A reachable probe
+does not prove inference succeeds: ordinary model/authentication errors remain visible as agent
+failures. Faux-provider tests perform no connectivity probes.
+
+## Docker cache pruning
+
+`--prune-docker-cache` is opt-in and requires `--n-concurrent 1` and environment deletion. Native
+configs can set `environment.kwargs.prune_docker_cache = true`. After each trial's verifier has
+stopped and `result.json` is saved, the launcher removes recorded unused task/agent/verifier image
+tags without forcing deletion, then runs `docker builder prune --all --force`. Images referenced
+by any container are skipped. Unrelated tags, shared paper utility images, and volumes are not
+pruned. Unused build cache is reclaimed **across the Docker builder**; use this option on a host
+where that cache cleanup is appropriate. Run one benchmark job at a time when pruning.
+
+Each trial records `docker-images.json` before builds, including failed starts, and
+`docker-cleanup.json` with removal outcomes. Cleanup failures are logged and never replace the
+saved benchmark result. Pruned prebuilt task images may need to be pulled again on resume.
+`run-state.json` in the job directory records running, paused, stopped, or finished state.
 
 ## Zones and submission
 
@@ -164,6 +231,7 @@ managed resources whose host owner died in a hard crash.
 With the venv active and Docker reachable:
 
 ```sh
+python -m unittest discover -s packages/evals/pier -p 'test_paper_job.py' -v
 PAPER_PIER_INTEGRATION=1 python -m unittest discover -s packages/evals/pier -p 'test_paper_agent*.py' -v
 ```
 
@@ -174,3 +242,6 @@ removed. Adapter regressions also check infrastructure failures and force-kill c
 preserves resources owned by another process. `PAPER_PIER_TEST_BASE` can select an existing Debian-derived image
 with Python, bash, and Git instead of installing Git in `python:3.12-slim`.
 These are infrastructure checks; faux usage statistics are synthetic and are not model scores.
+The disconnect/resume fixture runs three tasks, injects VPN loss on the second, and verifies that
+resume preserves the first task's result and archives the disconnected attempt. Its image cleanup
+uses Docker, while builder-wide pruning is mocked to preserve the host's unrelated cache.

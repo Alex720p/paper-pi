@@ -1,10 +1,19 @@
 """Deterministic Pier trial: real zones, staged submission, and a separate verifier."""
+import asyncio
 import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from pier.models.job.config import JobConfig
+from pier.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig
+from paper_agent import InferenceUnavailableError, PaperAgent
+import paper_cleanup
+from paper_job import launch, resume
 
 
 class PaperPierIntegration(unittest.TestCase):
@@ -24,7 +33,11 @@ class PaperPierIntegration(unittest.TestCase):
     def test_pier_deadline_multiplier_can_extend_the_task_deadline(self):
         self._fixture(extended_deadline=True)
 
-    def _fixture(self, timeout=False, agent_error=False, extended_deadline=False):
+    @unittest.skipUnless(os.environ.get("PAPER_PIER_INTEGRATION") == "1", "requires Docker")
+    def test_disconnect_resume_preserves_completed_tasks_and_prunes_after_verification(self):
+        self._fixture(recovery=True)
+
+    def _fixture(self, timeout=False, agent_error=False, extended_deadline=False, recovery=False):
         with tempfile.TemporaryDirectory(prefix="paper-pier-fixture-") as directory:
             root = Path(directory)
             task = root / "task"
@@ -76,6 +89,9 @@ class PaperPierIntegration(unittest.TestCase):
             env = dict(os.environ)
             env["PYTHONPATH"] = str(Path(__file__).parent)
             env["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+            if recovery:
+                self._recovery_fixture(root, task, image, steps)
+                return
             completed = subprocess.run([
                 "pier", "run", "-p", task, "--agent-import-path", "paper_agent:PaperAgent",
                 "--model", "faux/faux-1", "--ak", "fake_steps="+json.dumps(steps),
@@ -125,6 +141,82 @@ class PaperPierIntegration(unittest.TestCase):
             remaining = subprocess.run(["docker", "volume", "ls", "-q", *filters], check=True, capture_output=True, text=True)
             self.assertFalse(remaining.stdout.strip(), "private exec volume leaked")
             print(f"Pier fixture (timeout={timeout}, agent_error={agent_error}, extended_deadline={extended_deadline}): staged patch graded 1; shell edits excluded; zones cleaned.")
+
+    def _recovery_fixture(self, root, task, image, steps):
+        # Provider disconnect is injected after a real staged submission. No paid
+        # inference and no builder-wide cache mutation are needed for this test.
+        tasks = []
+        images = []
+        for index in range(3):
+            selected = root / f"task-{index}"
+            shutil.copytree(task, selected)
+            tag = f"{image}-task-{index}"
+            subprocess.run(["docker", "tag", image, tag], check=True)
+            images.append(tag)
+            for path in (selected / "task.toml", selected / "tests/Dockerfile"):
+                path.write_text(path.read_text().replace(image, tag))
+            tasks.append(TaskConfig(path=selected))
+            self.addCleanup(lambda tag=tag: subprocess.run(["docker", "image", "rm", tag], capture_output=True))
+        config = JobConfig(
+            jobs_dir=root / "jobs", job_name="recovery", n_concurrent_trials=1, tasks=tasks,
+            agents=[AgentConfig(import_path="paper_agent:PaperAgent", model_name="faux/faux-1",
+                                kwargs={"fake_steps": steps})],
+            environment=EnvironmentConfig(import_path="paper_environment:PaperDockerEnvironment",
+                                          kwargs={"prune_docker_cache": True}),
+        )
+        original_run = PaperAgent.run
+        original_command = paper_cleanup.docker_command
+        builder_calls = []
+
+        async def disconnect(agent, instruction, environment, context):
+            await original_run(agent, instruction, environment, context)
+            if environment.environment_dir.parent.name == "task-1":
+                context.metadata["paper"]["inferenceUnavailable"] = True
+                result = agent.logs_dir / "paper-result.json"
+                result.write_text(json.dumps(context.metadata["paper"]))
+                raise InferenceUnavailableError("Injected VPN expiry")
+
+        async def docker(*args):
+            if args[:2] == ("builder", "prune"):
+                builder_calls.append(args)
+                return 0, "builder prune mocked in integration test"
+            return await original_command(*args)
+
+        async def exercise():
+            with patch.object(PaperAgent, "run", disconnect):
+                self.assertEqual(await launch(config), 75)
+            job_dir = config.jobs_dir / config.job_name
+            results = sorted(job_dir.glob("*/result.json"))
+            self.assertEqual(len(results), 2)
+            completed = next(path for path in results if json.loads(path.read_text())["exception_info"] is None)
+            saved_completed = completed.read_bytes()
+            interrupted = next(path for path in results if path != completed)
+            self.assertEqual(json.loads(interrupted.read_text())["exception_info"]["exception_type"], "InferenceUnavailableError")
+            self.assertTrue((interrupted.parent / "agent/model.patch").exists())
+            self.assertEqual(len(builder_calls), 2)
+            for path in results:
+                self.assertEqual(json.loads(path.read_text())["verifier_result"]["rewards"]["reward"], 1)
+                self.assertTrue((path.parent / "docker-cleanup.json").exists())
+            # Recreate the interrupted fixture's pruned prebuilt tag, standing in
+            # for pulling the benchmark's image from its registry on resume.
+            subprocess.run(["docker", "tag", image, images[1]], check=True)
+            self.assertEqual(await resume(job_dir), 0)
+            self.assertEqual(completed.read_bytes(), saved_completed)
+            current = list(job_dir.glob("*/result.json"))
+            self.assertEqual(len(current), 3)
+            self.assertEqual(len(builder_calls), 4)
+            archived = list((job_dir / ".interrupted").glob("*/result.json"))
+            self.assertEqual(len(archived), 1)
+            self.assertTrue((archived[0].parent / "agent/model.patch").exists())
+            self.assertEqual(json.loads((job_dir / "run-state.json").read_text())["status"], "finished")
+            for path in current + archived:
+                paper = json.loads((path.parent / "agent/paper-result.json").read_text())
+                filters = ["--filter", "label=paper-api.managed=true", "--filter", f"label=paper-api.owner-pid={paper['processId']}"]
+                for args in (["docker", "ps", "-aq", *filters], ["docker", "volume", "ls", "-q", *filters]):
+                    output = subprocess.run(args, check=True, capture_output=True, text=True)
+                    self.assertFalse(output.stdout.strip(), "paper resources leaked")
+        with patch.dict(os.environ, {"LITELLM_LOCAL_MODEL_COST_MAP": "True"}), patch("paper_cleanup.docker_command", docker):
+            asyncio.run(exercise())
 
 
 if __name__ == "__main__":
