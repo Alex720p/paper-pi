@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paper-pi-deepswe"
+version = "0.1.0"
+description = "TOML launcher for paper-pi Docker zones on DeepSWE"
+requires-python = ">=3.12"
+dependencies = ["datacurve-pier==0.3.1"]
+
+[project.scripts]
+paper-deepswe = "paper_deepswe:main"
+pi-deepswe = "paper_deepswe:main"
+
+[tool.setuptools]
+py-modules = ["paper_config", "paper_deepswe", "paper_agent", "paper_job", "paper_environment", "paper_cleanup", "paper_recovery"]

@@ -1,11 +1,13 @@
 """Adapter failures and cleanup, without Docker or model requests."""
 import asyncio
 from contextlib import suppress
+import io
 import json
 import os
 from pathlib import Path
 import signal
 import sys
+import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -13,10 +15,86 @@ from unittest.mock import AsyncMock, patch
 
 from pier.models.agent.context import AgentContext
 from pier.agents.installed.base import NonZeroAgentExitCodeError
-from paper_agent import HostCommandError, InferenceUnavailableError, PaperAgent, cleanup_runner_resources, host_command
+from paper_agent import HostCommandError, InferenceUnavailableError, PaperAgent, cleanup_runner_resources, extract_source, host_command
+
+
+class PaperSourceExportTests(unittest.TestCase):
+    def test_regular_source_preserves_modes_and_skips_links_without_following_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "source.tar"
+            with tarfile.open(archive_path, "w") as archive:
+                folder = tarfile.TarInfo("fixtures")
+                folder.type = tarfile.DIRTYPE
+                archive.addfile(folder)
+                source = tarfile.TarInfo("source.sh")
+                source.size = 5
+                source.mode = 0o755
+                archive.addfile(source, io.BytesIO(b"hello"))
+                for name, target, kind in (("fixtures/null", "/dev/null", tarfile.SYMTYPE),
+                                           ("relative", "source.sh", tarfile.SYMTYPE),
+                                           ("hard", "source.sh", tarfile.LNKTYPE)):
+                    link = tarfile.TarInfo(name)
+                    link.type = kind
+                    link.linkname = target
+                    archive.addfile(link)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            skipped = extract_source(archive_path, workspace)
+            self.assertEqual((workspace / "source.sh").read_bytes(), b"hello")
+            self.assertEqual((workspace / "source.sh").stat().st_mode & 0o777, 0o755)
+            self.assertEqual([entry["path"] for entry in skipped], ["fixtures/null", "relative", "hard"])
+            self.assertEqual(skipped[0]["target"], "/dev/null")
+            self.assertFalse((workspace / "fixtures/null").is_symlink())
+            self.assertFalse((workspace / "relative").exists())
+            self.assertFalse((workspace / "hard").exists())
+
+    def test_path_traversal_and_special_files_are_rejected(self):
+        for name, kind in (("../escape", tarfile.REGTYPE), ("device", tarfile.CHRTYPE)):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archive_path = root / "source.tar"
+                with tarfile.open(archive_path, "w") as archive:
+                    member = tarfile.TarInfo(name)
+                    member.type = kind
+                    archive.addfile(member)
+                workspace = root / "workspace"
+                workspace.mkdir()
+                with self.assertRaises(tarfile.FilterError):
+                    extract_source(archive_path, workspace)
+                self.assertFalse((root / "escape").exists())
 
 
 class PaperAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_isolated_runner_receives_controlled_cancellation_and_finalizes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ready = root / "ready"
+            finalized = root / "finalized"
+            pids = []
+            child = asyncio.create_task(host_command([
+                sys.executable, "-c", "import signal,time,pathlib,sys; "
+                f"signal.signal(signal.SIGUSR1, lambda *_: (pathlib.Path({str(finalized)!r}).touch(), sys.exit(0))); "
+                f"pathlib.Path({str(ready)!r}).touch(); time.sleep(60)",
+            ], start_new_session=True, cancellation_signal=signal.SIGUSR1, on_start=pids.append))
+            try:
+                for _ in range(200):
+                    if ready.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertEqual(os.getsid(pids[0]), pids[0])
+                self.assertNotEqual(os.getpgid(pids[0]), os.getpgrp())
+                child.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await child
+                self.assertTrue(finalized.exists())
+            finally:
+                if not child.done():
+                    child.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await child
+
     async def test_pid_record_failure_still_waits_for_child_exit(self):
         pid = []
 
@@ -79,6 +157,7 @@ class PaperAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         async def command(argv, **kwargs):
             if argv[0] == "node":
+                self.assertTrue(kwargs["start_new_session"])
                 kwargs["on_start"](12345)
                 self.assertNotIn("timeoutMs", json.loads(Path(argv[-1]).read_text()))
                 if result is not None:

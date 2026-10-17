@@ -31,30 +31,79 @@ def job_lock(job_dir):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def archive_unfinished_trials(job_dir):
+def trial_rewards(result, trial_dir):
+    rewards = (result.get("verifier_result") or {}).get("rewards")
+    reward_path = trial_dir / "verifier/reward.json"
+    if rewards is None and reward_path.is_file():
+        rewards = json.loads(reward_path.read_text())
+    return rewards
+
+
+def is_infrastructure_failure(result, trial_dir):
+    if result is None:
+        return True
+    paper = ((result.get("agent_result") or {}).get("metadata") or {}).get("paper") or {}
+    error = result.get("exception_info")
+    return (
+        trial_rewards(result, trial_dir) is None
+        or paper.get("inferenceUnavailable") is True
+        or paper.get("failureKind") == "infrastructure"
+        or paper.get("submissionReady") is False
+        or (error is not None and error.get("exception_type") not in
+            ("AgentTimeoutError", "TimeoutError", "NonZeroAgentExitCodeError"))
+    )
+
+
+def read_attempts(job_dir):
+    attempts = []
+    for path in [*job_dir.glob("*/result.json"), *job_dir.glob(".interrupted/*/result.json")]:
+        result = json.loads(path.read_text())
+        task_path = ((result.get("config") or {}).get("task") or {}).get("path")
+        key = result.get("task_name") or task_path or result.get("trial_name") or path.parent.name
+        started = result.get("started_at")
+        started = datetime.fromisoformat(started.replace("Z", "+00:00")) if started else datetime.fromtimestamp(path.stat().st_mtime, UTC)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        attempts.append({"path": path.parent, "result": result, "key": str(key),
+                         "started": started, "infrastructure_error": is_infrastructure_failure(result, path.parent)})
+    return sorted(attempts, key=lambda attempt: (attempt["started"], str(attempt["path"])))
+
+
+def first_valid_attempts(attempts):
+    selected = {}
+    for attempt in attempts:
+        if not attempt["infrastructure_error"]:
+            selected.setdefault(attempt["key"], attempt)
+    return selected
+
+
+def archive_unfinished_trials(job_dir, *, first_valid_only=True):
     # Classify every attempt before moving any, so malformed artifacts cannot
     # leave a partially archived job. Include result-less starts that lack config.
+    attempts = read_attempts(job_dir)
+    by_path = {attempt["path"]: attempt for attempt in attempts}
+    selected = first_valid_attempts(attempts)
     unfinished = []
     for trial in sorted(job_dir.iterdir()):
         if not trial.is_dir() or trial.name.startswith("."):
             continue
         if not any((trial / name).exists() for name in ("config.json", "result.json", "trial.log", "agent", "verifier", "artifacts")):
             continue
-        result_path = trial / "result.json"
-        retry = not result_path.exists()
-        if result_path.exists():
-            result = json.loads(result_path.read_text())
-            error = result.get("exception_info")
-            metadata = (result.get("agent_result") or {}).get("metadata") or {}
-            paper = metadata.get("paper") or {}
-            retry = (
-                paper.get("inferenceUnavailable") is True
-                or (error is not None and error.get("exception_type") not in
-                    ("AgentTimeoutError", "TimeoutError", "NonZeroAgentExitCodeError"))
-                or not (trial / "verifier/reward.json").is_file()
-            )
-        if retry:
+        attempt = by_path.get(trial)
+        if attempt is None or attempt["infrastructure_error"] or (first_valid_only and selected[attempt["key"]]["path"] != trial):
             unfinished.append(trial)
+    restorations = []
+    for attempt in selected.values() if first_valid_only else []:
+        if attempt["path"].parent != job_dir / ".interrupted":
+            continue
+        result = attempt["result"]
+        name = result.get("trial_name") or (result.get("config") or {}).get("trial_name")
+        if not name or Path(name).name != name or name in (".", ".."):
+            raise ValueError(f"Archived graded attempt lacks a safe trial_name: {attempt['path']}")
+        target = job_dir / name
+        if target.exists() and target not in unfinished:
+            raise ValueError(f"Cannot restore graded attempt over {target}")
+        restorations.append((attempt["path"], target))
     archived = []
     for trial in unfinished:
         archive = job_dir / ".interrupted"
@@ -62,6 +111,8 @@ def archive_unfinished_trials(job_dir):
         destination = archive / f"{trial.name}-{uuid4().hex[:8]}"
         trial.rename(destination)
         archived.append(destination)
+    for source, destination in restorations:
+        source.rename(destination)
     return archived
 
 
@@ -102,6 +153,9 @@ async def run_job(job, *, prune):
         state_path.write_text(json.dumps(state, indent=2) + "\n")
     if disconnected:
         command = f"{shlex.quote(sys.executable)} -m paper_job resume {shlex.quote(str(job.job_dir))}"
+        if any(agent.kwargs.get("model_config") is not None for agent in job.config.agents):
+            executable = Path(sys.executable).parent / "paper-deepswe"
+            command = f"{shlex.quote(str(executable))} resume {shlex.quote(str(job.job_dir))}"
         print(f"Inference access was lost. Results and partial work are saved.\n"
               f"Reconnect the VPN/SSH session, restore host credentials, then run:\n  {command}", file=sys.stderr)
         return 75

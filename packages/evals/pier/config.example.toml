@@ -1,0 +1,27 @@
+# Filesystem paths resolve from the directory where you launch the command.
+[model]
+base_url = "https://inference.rcp.epfl.ch/v1/"
+model_id = "zai-org/GLM-5.3-Flash"
+api_key_env = "MODEL_API_KEY"
+context_window = 400000
+max_tokens = 131072
+reasoning = true
+thinking = "max"
+
+[model.thinking_level_map]
+low = "low"
+high = "high"
+max = "max"
+
+[model.sampling]
+temperature = 0.95
+top_p = 1.0
+
+[model.compat]
+supportsDeveloperRole = false
+maxTokensField = "max_tokens"
+
+[run]
+tasks_dir = "../../pi-deepswe/datasets/deep-swe/tasks"
+jobs_dir = "packages/evals/.eval/deep-swe"
+concurrency = 1

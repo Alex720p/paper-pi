@@ -17,6 +17,8 @@ from pier.environments.base import BaseEnvironment
 from pier.environments.docker.docker import DockerEnvironment
 from pier.models.agent.context import AgentContext
 
+from paper_config import ModelConfig
+
 
 class HostCommandError(RuntimeError):
     """A completed host process failed; infrastructure callers retain RuntimeError semantics."""
@@ -30,11 +32,13 @@ CANCELLATION_GRACE_SECONDS = 15
 
 
 async def host_command(argv, *, cwd=None, env=None, output=None, error_output=None,
-                       cancellation_signal=signal.SIGTERM, on_start=None, on_force_kill=None):
+                       cancellation_signal=signal.SIGTERM, on_start=None, on_force_kill=None,
+                       start_new_session=False):
     process = await asyncio.create_subprocess_exec(
         *map(str, argv), cwd=cwd, env=env,
         stdout=output if output is not None else asyncio.subprocess.PIPE,
         stderr=error_output if error_output is not None else asyncio.subprocess.PIPE,
+        start_new_session=start_new_session,
     )
     try:
         if on_start is not None:
@@ -103,12 +107,37 @@ async def stage_host_files(workspace):
         await host_command(["git", "--literal-pathspecs", "add", "--", *paths[offset:offset+100]], cwd=workspace)
 
 
+def extract_source(archive_path, workspace):
+    """Stage regular source only; link fixtures remain in the original task image."""
+    skipped = []
+
+    def source_filter(member, destination):
+        if member.issym() or member.islnk():
+            skipped.append({"path": member.name, "target": member.linkname,
+                            "type": "symlink" if member.issym() else "hardlink"})
+            return None
+        if not member.isfile() and not member.isdir():
+            raise tarfile.SpecialFileError(member)
+        return tarfile.data_filter(member, destination)
+
+    with tarfile.open(archive_path) as archive:
+        archive.extractall(workspace, filter=source_filter)
+    return skipped
+
+
 class PaperAgent(BaseAgent):
-    def __init__(self, *args, pi_root=None, fake_steps=None, thinking_level=None, max_output_tokens=None, **kwargs):
+    def __init__(self, *args, pi_root=None, fake_steps=None, thinking_level=None, max_output_tokens=None,
+                 model_config=None, **kwargs):
         self.extra_env = kwargs.pop("extra_env", {})
         super().__init__(*args, **kwargs)
         self.pi_root = Path(pi_root).resolve() if pi_root else Path(__file__).resolve().parents[3]
         self.fake_steps = fake_steps
+        self.model_config = ModelConfig.model_validate(model_config) if model_config is not None else None
+        if self.model_config is not None:
+            if self.model_name != self.model_config.identity:
+                raise ValueError("Model identity must match the saved TOML configuration")
+            thinking_level = self.model_config.thinking
+            max_output_tokens = self.model_config.max_tokens
         if thinking_level is not None and thinking_level not in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
             raise ValueError("Invalid thinking_level")
         if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens < 1):
@@ -146,14 +175,20 @@ class PaperAgent(BaseAgent):
         self._workspace = root / "workspace"
         self._workspace.mkdir()
         try:
+            prerequisites = await environment.exec(
+                "for program in python3 bash git cp mount umount; do "
+                "command -v \"$program\" >/dev/null || { echo \"Missing task-image tool: $program\" >&2; exit 1; }; done")
+            if prerequisites.return_code:
+                raise RuntimeError(f"Task image cannot support Docker execution: {prerequisites.stderr}")
             archive_path = f"/tmp/paper-source-{uuid.uuid4().hex}.tar"
             result = await environment.exec(
                 f"cd /app && git -c safe.directory=/app archive --format=tar HEAD --output={archive_path}")
             if result.return_code:
                 raise RuntimeError(f"Task repository export failed: {result.stderr}")
             await environment.download_file(archive_path, root / "source.tar")
-            with tarfile.open(root / "source.tar") as archive:
-                archive.extractall(self._workspace, filter="data")
+            skipped = extract_source(root / "source.tar", self._workspace)
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
+            (self.logs_dir / "source-export.json").write_text(json.dumps({"skipped_links": skipped}, indent=2) + "\n")
             await host_command(["git", "init", "--quiet"], cwd=self._workspace)
             await stage_host_files(self._workspace)
             await host_command(["git", "-c", "user.name=paper-eval", "-c", "user.email=paper-eval@localhost",
@@ -203,6 +238,11 @@ class PaperAgent(BaseAgent):
             task_env = json.loads(result.stdout)
         input_path = root / "input.json"
         host_agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser()
+        if self.model_config is not None:
+            host_agent_dir = root / "model-config"
+            host_agent_dir.mkdir(mode=0o700)
+            (host_agent_dir / "models.json").write_text(json.dumps(self.model_config.pi_models()))
+            (host_agent_dir / "auth.json").write_text("{}")
         input_path.write_text(json.dumps({
             "workspace": str(self._workspace), "agentDir": str(root / "agent"),
             "logsDir": str(self.logs_dir.resolve()), "image": self._image,
@@ -239,6 +279,7 @@ class PaperAgent(BaseAgent):
                 await host_command(["node", "--import", "tsx", runner, input_path],
                                    cwd=self.pi_root, env=env, output=output, error_output=diagnostics,
                                    cancellation_signal=signal.SIGUSR1,
+                                   start_new_session=True,
                                    on_start=record_process, on_force_kill=record_forced_kill)
         except BaseException as cause:
             error = cause

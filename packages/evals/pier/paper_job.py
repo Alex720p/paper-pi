@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import hashlib
 import importlib.metadata
 import json
 import subprocess
@@ -130,11 +131,13 @@ def exit_status(job_dir, status):
     return int(not results or any(result.get("verifier_result") is None for result in results))
 
 
-async def launch(config):
+async def launch(config, *, provenance=None):
     job_dir = config.jobs_dir / config.job_name
     job_dir.mkdir(parents=True, exist_ok=False)
     with job_lock(job_dir):
         (job_dir / "config.json").write_text(config.model_dump_json(indent=2) + "\n")
+        if provenance is not None:
+            (job_dir / "pi-deepswe-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         job = await Job.create(config)
         print(f"Job directory: {job_dir}", flush=True)
         status = await run_job(job, prune=config.environment.kwargs.get("prune_docker_cache", False))
@@ -151,7 +154,19 @@ async def resume(job_dir):
         if saved.retry.max_retries != 0:
             raise ValueError("Only jobs with max_retries=0 can be resumed without deleting attempt artifacts")
         await validate_tasks(saved)
-        archived = archive_unfinished_trials(job_dir)
+        pi_root = Path(saved.agents[0].kwargs.get("pi_root", Path(__file__).resolve().parents[3]))
+        sources = [*Path(__file__).parent.glob("paper_*.py"),
+                   pi_root / "packages/evals/src/paper-pier.ts",
+                   *sorted((pi_root / "packages/coding-agent/examples/extensions/paper").glob("*.ts"))]
+        revision = subprocess.run(["git", "-C", str(pi_root), "rev-parse", "HEAD"], capture_output=True, text=True)
+        entry = {"started_at": datetime.now(UTC).isoformat(),
+                 "selection_policy": "first_valid_completed_grade" if saved.n_attempts == 1 else "native_multiple_attempts",
+                 "commit": revision.stdout.strip() if revision.returncode == 0 else None,
+                 "source_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}}
+        archived = archive_unfinished_trials(job_dir, first_valid_only=saved.n_attempts == 1)
+        entry["archived_attempts"] = [str(path.relative_to(job_dir)) for path in archived]
+        with (job_dir / "resume-history.jsonl").open("a") as history:
+            history.write(json.dumps(entry, sort_keys=True) + "\n")
         print(f"Resuming {job_dir}; archived {len(archived)} unfinished attempts.", flush=True)
         job = await Job.create(saved)
         status = await run_job(job, prune=saved.environment.kwargs.get("prune_docker_cache", False))

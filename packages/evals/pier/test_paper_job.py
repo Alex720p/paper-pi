@@ -74,6 +74,41 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
             archive_unfinished_trials(self.root)
         self.assertTrue(first.exists())
 
+    def test_resume_restores_first_valid_zero_and_archives_a_later_pass(self):
+        original = self.trial("first")
+        later = self.trial("later")
+        for trial, reward, started in ((original, 0, "2026-10-12T10:00:00Z"),
+                                       (later, 1, "2026-10-12T11:00:00Z")):
+            result = json.loads((trial / "result.json").read_text())
+            result.update(task_name="same-task", trial_name=trial.name, started_at=started,
+                          verifier_result={"rewards": {"reward": reward}})
+            (trial / "result.json").write_text(json.dumps(result))
+        saved = (original / "result.json").read_bytes()
+        archive = self.root / ".interrupted"
+        archive.mkdir()
+        original.rename(archive / "first-12345678")
+        archived = archive_unfinished_trials(self.root)
+        self.assertEqual(len(archived), 1)
+        self.assertEqual((original / "result.json").read_bytes(), saved)
+        self.assertFalse(later.exists())
+        self.assertEqual(json.loads((archived[0] / "result.json").read_text())["verifier_result"]["rewards"]["reward"], 1)
+        self.assertEqual(archive_unfinished_trials(self.root), [])
+
+    def test_infrastructure_metadata_is_retried_even_with_a_reward_and_no_exception(self):
+        trial = self.trial("infra", metadata={"paper": {"failureKind": "infrastructure", "submissionReady": False}})
+        archived = archive_unfinished_trials(self.root)
+        self.assertFalse(trial.exists())
+        self.assertEqual(len(archived), 1)
+
+    def test_native_multiple_attempt_jobs_retain_all_graded_attempts(self):
+        trials = [self.trial(name) for name in ("first", "second")]
+        for trial in trials:
+            result = json.loads((trial / "result.json").read_text())
+            result["task_name"] = "same-task"
+            (trial / "result.json").write_text(json.dumps(result))
+        self.assertEqual(archive_unfinished_trials(self.root, first_valid_only=False), [])
+        self.assertTrue(all(trial.exists() for trial in trials))
+
     def test_lock_rejects_concurrent_resume_and_releases_after_error(self):
         with self.assertRaises(RuntimeError):
             with job_lock(self.root):
@@ -113,7 +148,7 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((self.root / "trial/result.json").exists())
             self.assertTrue((self.root / "trial/verifier/reward.json").exists())
 
-        job = SimpleNamespace(job_dir=self.root, add_hook=lambda event, callback: start.append(callback),
+        job = SimpleNamespace(job_dir=self.root, config=make_config(self.root), add_hook=lambda event, callback: start.append(callback),
                               on_trial_ended=callbacks.append, run=execute)
         cleaner = AsyncMock(side_effect=cleanup)
         with patch("paper_recovery.prune_trial_docker_cache", cleaner):
@@ -131,7 +166,7 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
                 agent_result=SimpleNamespace(metadata={"paper": {"inferenceUnavailable": True}})))
             async with asyncio.TaskGroup() as group:
                 group.create_task(callbacks[0](event))
-        job = SimpleNamespace(job_dir=self.root, add_hook=Mock(), on_trial_ended=callbacks.append, run=execute)
+        job = SimpleNamespace(job_dir=self.root, config=make_config(self.root), add_hook=Mock(), on_trial_ended=callbacks.append, run=execute)
         self.assertEqual(await run_job(job, prune=False), 75)
 
     async def test_unrelated_job_error_is_propagated_and_state_is_stopped(self):
@@ -178,6 +213,9 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
         with patch("paper_job.validate_tasks", AsyncMock()), patch("paper_job.Job.create", AsyncMock(side_effect=create)), \
              patch("paper_job.run_job", AsyncMock(return_value=75)):
             self.assertEqual(await resume(self.root), 75)
+        history = [json.loads(line) for line in (self.root / "resume-history.jsonl").read_text().splitlines()]
+        self.assertEqual(history[0]["selection_policy"], "first_valid_completed_grade")
+        self.assertTrue(history[0]["source_sha256"])
 
     async def test_cli_freezes_selection_and_preserves_native_budgets(self):
         paths = [self.root / name for name in ("task-a", "task-b", "task-c")]

@@ -69,6 +69,17 @@ function relativeInWorkspace(session: PaperSession, candidate: string): string {
 	return located.relative;
 }
 
+function mutableRelative(session: PaperSession, candidate: string): string {
+	const relative = relativeInWorkspace(session, candidate);
+	if (relative === ".git" || relative.startsWith(`.git${path.sep}`)) {
+		throw new Error(
+			"Git metadata is managed by the harness and cannot be staged. " +
+				"Use bash for private Git operations; the harness commits staged source changes.",
+		);
+	}
+	return relative;
+}
+
 // --- operations --------------------------------------------------------------
 
 export function createPaperReadOps(session: PaperSession): ReadOperations {
@@ -102,7 +113,7 @@ export function createPaperReadOps(session: PaperSession): ReadOperations {
  * command would see the file as it was when the VM booted.
  */
 async function stageWrite(session: PaperSession, filePath: string, content: string): Promise<void> {
-	const relative = relativeInWorkspace(session, filePath);
+	const relative = mutableRelative(session, filePath);
 	await session.mutateStaged(() => session.write.writeFile(relative, content));
 }
 
@@ -119,13 +130,14 @@ export function createPaperEditOps(session: PaperSession): EditOperations {
 		readFile: (filePath) => readBytes(session, filePath),
 		writeFile: (filePath, content) => stageWrite(session, filePath, content),
 		access: async (filePath) => {
+			mutableRelative(session, filePath);
 			await statOf(session, filePath);
 		},
 	};
 }
 
 export async function executePaperDelete(session: PaperSession, filePath: string): Promise<void> {
-	const relative = relativeInWorkspace(session, filePath);
+	const relative = mutableRelative(session, filePath);
 	await session.mutateStaged(() => session.write.deleteFile(relative));
 }
 

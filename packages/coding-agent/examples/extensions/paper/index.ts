@@ -99,7 +99,8 @@ const DOCKER_ZONE_PROMPT =
 	"Private shell changes shadow staged files even after a staged edit. " +
 	"Use read before edit to get staged contents; bash cat may show a different private version. " +
 	"Run formatters in check mode, or copy final generated contents through write. " +
-	"The evaluation harness commits staged changes for you; a shell git commit is not submitted.";
+	"The evaluation harness commits staged changes for you; a shell git commit is not submitted. " +
+	"Git metadata under .git is reserved for the harness and cannot be written, edited, or deleted through staged tools.";
 
 export default function (pi: ExtensionAPI): void {
 	// Spread into the registrations below for their schema, description and renderers only; the

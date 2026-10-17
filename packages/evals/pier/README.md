@@ -4,132 +4,129 @@ This adapter runs paper-pi through **Pier 0.3.1**, using each task's Docker envi
 owns image selection/building, task limits, artifact collection, and the separate verifier.
 Pi's model calls run on the host; model credentials are never mounted into a zone.
 
-## Setup
+## Setup on this VPS
 
-Use a Linux host with Node, Python 3.12+, Docker Compose, and a Docker daemon that permits overlay
-mounts inside an exec container. Nix and KVM are unnecessary for this eval profile.
-
-From the paper-pi checkout, with paper-api checked out alongside it:
+Docker and Compose are already installed. With paper-api checked out alongside paper-pi:
 
 ```sh
-cd ../paper-api
-npm install --ignore-scripts
-node_modules/.bin/tsup
-cd ../paper-pi
-npm install --ignore-scripts
-cd packages/coding-agent/examples/extensions/paper
-npm install --ignore-scripts
-cd ../../../../..
-uv venv --python 3.12 packages/evals/pier/.venv
-uv pip install --python packages/evals/pier/.venv/bin/python -r packages/evals/pier/requirements.txt
-. packages/evals/pier/.venv/bin/activate
-git clone https://github.com/datacurve-ai/deep-swe /path/to/deep-swe
+cd /home/ubuntu/zones/paper-pi
+python3 packages/evals/pier/bootstrap.py
 ```
 
-The adapter is pinned because it uses Pier's Docker Compose container lookup. Keep paper-api's
-`dist` up to date: the extension consumes compiled exports through its `file:` dependency.
+Bootstrap installs Node 24.21.0 under `zones/.tools`, Python 3.12.15 in `.venv`, and
+`datacurve-pier==0.3.1` with locked Python dependencies and the `paper-deepswe` entry point.
+It reuses the baseline's uv/Python
+installation when available, installs npm dependencies from their existing lockfiles with
+scripts disabled, compiles paper-api, and hydrates Pi's ignored provider data from the
+checksum-verified 0.83.0 release artifact. This fork's additional Baseten and Copilot metadata
+comes from a saved snapshot of its committed generator. The benchmark's custom model comes from TOML.
+Nix, a microVM, KVM, and a local inference model are unnecessary.
 
-## Run
+If `config.local.toml` does not exist, bootstrap copies the old pi-deepswe `[model]` section
+verbatim and points `[run]` at the existing DeepSWE dataset and the paper output directory.
+Later bootstrap runs preserve this file. `config.example.toml` shows the same schema.
+Paths resolve from the directory where the command is launched. The dataset used on this VPS
+is `/home/ubuntu/pi-deepswe/datasets/deep-swe`, pinned at
+`0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea` (113 tasks).
 
-Authenticate Pi normally, or provide the selected provider's API key in the host environment.
-The adapter uses the host's `auth.json` and `models.json` from `PI_CODING_AGENT_DIR` (default
-`~/.pi/agent`), while isolating trial settings, extensions, and sessions in a fresh directory.
-The model argument uses **Pi provider/model IDs**, for example `openai/gpt-5.5` or
-`openai-codex/gpt-5.5` for configured subscription credentials.
+## Run using the baseline-compatible config
 
-From the paper-pi checkout:
+Restore the EPFL VPN with `/home/ubuntu/epfl-vpn/connect` and export `MODEL_API_KEY` in the
+benchmark shell. The VPN requires your login/MFA. Then run from the paper-pi checkout:
 
 ```sh
-export PYTHONPATH="$PWD/packages/evals/pier${PYTHONPATH:+:$PYTHONPATH}"
-python -m paper_job run -p /path/to/deep-swe/tasks/etree-xml-diff-patch \
-  --model openai/gpt-5.5 --n-concurrent 1 \
-  --jobs-dir packages/evals/.eval/deep-swe --max-retries 0
+.venv/bin/paper-deepswe check --config config.local.toml --all
+.venv/bin/paper-deepswe run --config config.local.toml --all --prune-docker-cache
 ```
 
-For the corpus, change `-p` to `/path/to/deep-swe/tasks`. Use `--n-tasks` and `--sample-seed`
-for a subset. This adapter runs the paper arm only; it creates no paired baseline. Execution is
-currently local Linux Docker only. MCP/skills tasks fail explicitly instead of running without
-their required tools. Thinking defaults to `high` for models registered with `reasoning: true`,
-and `off` otherwise. Set `--ak thinking_level=high` to select it explicitly. A model that always
-thinks needs provider-compatible reasoning configuration; `off` cannot disable server defaults.
+The Python environment is this checkout's `.venv`. `paper-deepswe` identifies the zones runner;
+`pi-deepswe` remains an alias for the exact old command. Both names run the same paper adapter.
+The original baseline executable lives in `/home/ubuntu/pi-deepswe/.venv/bin/pi-deepswe`.
+The command options and TOML schema match the baseline. No `--ak`, activation, Node PATH, or host
+Pi configuration is needed. The launcher selects the locally installed Node runtime itself.
+The TOML model configuration supplies endpoint, model ID, context/output limits, reasoning,
+thinking map, sampling, compatibility, and optional prices. Compatibility fields are forwarded
+as configured; no `thinkingFormat` or `chatTemplateKwargs` is inserted. A fresh host-only
+catalog and empty auth file prevent user Pi settings from overriding the benchmark model.
+Only the API key environment variable's name is saved in configuration and provenance.
+Host inference retains localhost addresses unchanged.
 
-For EPFL's GLM-5.3-Flash, the entry in `~/.pi/agent/models.json` needs:
+`check` validates configuration, Node imports, Docker/Compose, and every selected task's
+single-step Linux/no-network profile. It makes no inference requests and does not pull all
+task images. Task-image tool checks run during setup; model connectivity/authentication and
+server request compatibility are exercised by a real trial.
 
-```json
-{
-  "id": "zai-org/GLM-5.3-Flash",
-  "reasoning": true,
-  "thinkingLevelMap": { "off": null, "minimal": null, "medium": null, "xhigh": null, "max": null },
-  "compat": {
-    "thinkingFormat": "chat-template",
-    "chatTemplateKwargs": { "reasoning_effort": { "$var": "thinking.effort" } }
-  }
-}
-```
+For a single-task pilot, omit `--all` (defaults to `abs-module-cache-flags`) or use
+`--task <name>`. For a repeatable subset, use `--n-tasks 5 --seed 42`. Selection follows the
+old sorted-then-seeded-shuffle algorithm and is frozen as absolute paths for resume.
+The wrapper rejects `concurrency` other than 1, runs one attempt per task with no whole-trial
+retries, and locks against another wrapper job sharing this zones directory. Run the old
+baseline and any other inference clients separately as well.
 
-Keep the entry's other fields. Its [published chat template](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/chat_template.jinja)
-accepts `low` and `high`, and defaults to maximum effort when missing. Use
-`--model epfl/zai-org/GLM-5.3-Flash --ak thinking_level=high --n-concurrent 1`.
-With a provider limited to one active request, run only one Pier job at a time too.
-The EPFL endpoint must be reachable from the host through the EPFL network or VPN; model calls
-do not go through the network zone.
-
-`--ak max_output_tokens=32768` optionally caps each response, including reasoning. Without it,
-the catalog's `maxTokens` applies. A cap can truncate reasoning or tool arguments and fail a task;
-it is a limit rather than a guarantee the model will finish its response.
-
-The launcher defaults to one concurrent trial and no automatic retries. `--config job.json`
-(or YAML) accepts Pier's native `JobConfig`, including timeout multipliers and resource overrides;
-set its agent import to `paper_agent:PaperAgent`. CLI options override the corresponding saved
-config fields. The launcher resolves dataset sampling into explicit absolute task paths before
-starting, so reconnecting cannot resample the corpus. Existing direct `pier run` commands remain
-available, but the paper launcher adds automatic job pause and optional pruning hooks.
+Task CPU, memory, and timeout settings are unchanged. Each task's 8192 MiB is a container
+ceiling, not preallocated RAM. Limits apply per zone, so total trial usage can exceed one
+container's ceiling. Docker volumes have no portable hard disk quota. On this VPS, check
+memory/disk use during the pilot before committing to the full corpus; no swap is installed.
 
 ## VPN expiry and resume
 
-Run long jobs inside `tmux` to keep them alive when the SSH connection closes:
+Use `tmux new -s paper-eval` for a long job; run the same command above inside it.
+Detach with Ctrl-b, then d; reconnect with `tmux attach -t paper-eval`.
+The launcher prints the job directory before execution. On confirmed inference loss, it saves
+staged work and logs, closes zones, pauses the queue, exits 75, and prints:
 
 ```sh
-tmux new -s paper-eval
-. packages/evals/pier/.venv/bin/activate
-export PYTHONPATH="$PWD/packages/evals/pier${PYTHONPATH:+:$PYTHONPATH}"
-python -m paper_job run -p /path/to/deep-swe/tasks \
-  --model epfl/zai-org/GLM-5.3-Flash --ak thinking_level=high \
-  --jobs-dir packages/evals/.eval/deep-swe --prune-docker-cache
+.venv/bin/paper-deepswe resume packages/evals/.eval/deep-swe/<job-name>
 ```
 
-Detach with Ctrl-b, then d. After reconnecting SSH, use `tmux attach -t paper-eval`.
-The launcher prints the job directory before execution. Keep that directory and the original
-task paths. When inference becomes unreachable, the runner saves staged work, logs, and a partial
-patch, closes zones, and pauses the job after the trial result and verification finish. The
-launcher exits with status 75 and prints a resume command. Reconnect the VPN, restore host model
-credentials as needed, then run from the paper-pi checkout:
+Reconnect the VPN and restore the key before resuming. The saved selection, complete model
+settings, limits, and pruning policy are reused even if the original TOML changes. Resume
+restarts interrupted tasks from the beginning. Graded completed tasks, including zero scores,
+graded timeouts, and finalized agent failures, are skipped. Infrastructure/ungraded attempts
+are archived under `.interrupted/` before retrying, preserving their logs and patches.
+Manual interruption and process crashes use the same resume command.
+
+Press Ctrl+C once in the launcher's terminal to stop the queue gracefully. The Node runner uses
+its own process session, so terminal signals do not race its sandbox cleanup hooks. The launcher
+requests finalization with SIGUSR1, waits for the runner, and records the cancelled trial for
+retry. A manual interruption is not a completed graded timeout. Let cleanup finish before resume.
+
+Summary and resume use the first valid completed grade per task, including reward 0, graded
+timeouts, and finalized agent errors. A VPN-interrupted or infrastructure-failed attempt remains
+retryable even if it has a raw verifier reward. Summary includes current and archived attempts,
+marks the selected result, and reports historical infrastructure attempts separately from tasks
+still lacking a valid grade. A later pass cannot replace an earlier valid reward 0. All original
+records are retained; resume can restore an archived first valid grade instead of rerunning it.
+
+The host connectivity monitor probes the effective endpoint's `/models` route without
+generating tokens. Probes time out after 20 seconds, run 30 seconds apart while inference is
+active, and require three consecutive failures; streamed activity resets the count.
+Authentication errors, unsupported routes, and rate limits establish reachability, while
+transport failures and HTTP 502/503/504 count as unavailable. Reachability does not prove an
+inference request succeeds; actual model/authentication failures remain visible in results.
+
+Each new job saves `config.json` and `pi-deepswe-provenance.json` with task selection, model
+settings, repository revisions/dirty flags, runtime/package versions, provider-data hashes,
+and zone profile. Inspect results with `.venv/bin/paper-deepswe summary <job-directory>`.
+Every resume appends `resume-history.jsonl` with the implementation commit, source SHA-256
+fingerprints, selected result policy, and archived attempt paths. This records implementation
+repairs between resumptions without changing the original provenance or model configuration.
+
+## Native Pier interface
+
+Existing native JSON/YAML jobs and provider-based Pi authentication remain available:
 
 ```sh
-. packages/evals/pier/.venv/bin/activate
-export PYTHONPATH="$PWD/packages/evals/pier${PYTHONPATH:+:$PYTHONPATH}"
-python -m paper_job resume packages/evals/.eval/deep-swe/<job-name>
+export PATH="$PWD/../.tools/node-v24.21.0-linux-x64/bin:$PWD/.venv/bin:$PATH"
+.venv/bin/python -m paper_job run -p /path/to/deep-swe/tasks \
+  --model provider/model-id --n-concurrent 1 --max-retries 0 \
+  --jobs-dir packages/evals/.eval/deep-swe
 ```
 
-Resume uses the saved task selection, model ID, agent options, limits, concurrency, and pruning
-setting. It restarts the interrupted task **from the beginning**, with a fresh conversation and
-workspace. Completed graded tasks are skipped, including reward zero, graded timeouts, and
-finalized ordinary agent failures. Infrastructure failures and attempts without verification
-are also retried. Their complete trial directories are moved under `<job-dir>/.interrupted/`
-before Pier scans completed results, preserving logs, patches, and previous verifier output.
-The same command handles a manual interruption or process crash. Concurrent launches/resumes
-of the same job are rejected. Jobs created with the earlier documented `pier run` command can
-also be resumed if they use this agent, local Docker, and `max_retries = 0`.
-
-The connectivity monitor runs on the host, where paper-pi makes its LLM requests. Before the
-prompt and while inference is active, it probes the effective model endpoint's `/models` route
-without generating tokens. A probe times out after 20 seconds; probes are spaced 30 seconds apart,
-and three consecutive failures confirm loss of access. Streamed model activity resets failures.
-HTTP authentication errors, unsupported routes, and rate limits establish reachability and do
-not trigger VPN recovery; transport failures and HTTP 502/503/504 count as unavailable. Actual
-inference transport errors also trigger bounded connectivity confirmation. A reachable probe
-does not prove inference succeeds: ordinary model/authentication errors remain visible as agent
-failures. Faux-provider tests perform no connectivity probes.
+This advanced interface uses host Pi `auth.json`/`models.json`, allows `--ak` agent options,
+and accepts `--config` for Pier's native JobConfig. Resume these jobs with
+`.venv/bin/python -m paper_job resume <job-directory>`. The TOML wrapper is the interface
+for the baseline-compatible paper run.
 
 ## Docker cache pruning
 
@@ -170,6 +167,17 @@ archive of the task's `HEAD`; the read/write staging view excludes `.git`, `node
 `build`, `.venv`, `__pycache__`, and `.next`. Those image directories remain available to exec.
 Repository-relative paths and `/app/...` paths address the staged source tools.
 
+Source export skips symbolic and hard links rather than following them onto the host; it records
+their paths and targets in `agent/source-export.json`. The task image retains its original link
+fixtures inside exec and the separate verifier. Skipping a link in the host baseline does not
+submit a deletion of the image's link. Regular source extraction still validates archive paths
+and rejects special files. This supports Helm's tracked `/dev/null` fixture without changing
+the task image or verifier.
+
+Staged write/edit/delete operations reject `.git` and its descendants before mutation. The
+disposable submission repository's Git metadata belongs to the harness. `.gitignore`, `.github`
+and ordinary source files remain writable. Private Git commands in exec are unchanged.
+
 Shell writes and deletion whiteouts stay in exec's private overlay upper. They persist between
 commands, lower refreshes, and restarts, and can shadow later staged edits. The agent must use
 `write` / `edit` for submitted source changes; shell `git commit`, formatters, and code generation
@@ -184,6 +192,11 @@ Shell results remind the agent to submit source through `write` / `edit` / `dele
 `read` to obtain the staged contents: shell reads can show a different private version. Run
 formatters in check mode, or copy final generated contents through `write`. Passing tests against
 private shell changes does not validate the submitted patch.
+
+The private overlay backing directories under `/paper-state` remain accessible to exec commands.
+Directly modifying a mounted backing layer can corrupt exec's private filesystem view and cause
+stale-file-handle errors. This repair leaves exec's overlay, permissions and refresh semantics
+unchanged; copied snapshots still isolate those backing files from the authoritative staged tree.
 
 The eval profile pins `runtime: runc`, `zone.backend: docker`, `/app`, and `autoCommit: true` using
 `PAPER_CONFIG_PATH`. Task-local `.pi/paper.json`, user extensions, skills, prompt templates, and
@@ -201,6 +214,7 @@ Each trial records:
   heartbeat every 15 seconds with the current phase and time since the last activity.
 - `agent/runner-stderr.txt`: runner diagnostics, persisted as they happen, including on interruption.
 - `agent/runner-process.json`: child PID recorded at spawn, and whether forced termination was required.
+- `agent/source-export.json`: archive links omitted from the host staging baseline, with original targets.
 - `agent/sessions/*.jsonl` and `agent/transcripts/*.jsonl`: native Pi session and paper transcript.
 - `agent/model.patch`: staged source changes actually submitted; no private shell changes.
 - Pier's `result.json`: token/cost context, paper metadata, repository revisions and dirty flags,
@@ -213,8 +227,8 @@ CPU, memory, and PID limits apply **per zone**; the entire trial can use more th
 limit. Pier alone enforces its agent/verifier deadlines, including overrides and multipliers;
 shell calls default to 120 seconds and accept
 the bash tool's `timeout` override. Docker volume storage has no portable hard quota; requested
-storage is recorded with `storageLimitEnforced: false`. The image must include Python 3, bash,
-cp, mount, and umount. Staged symlinks are unsupported.
+storage is recorded with `storageLimitEnforced: false`. The image must include Python 3, bash, Git,
+cp, mount, and umount; setup fails explicitly if a tool is absent. Staged symlinks are unsupported.
 Source read/edit inputs must fit within 32 MiB and be complete; oversized reads fail before edits.
 
 The exec container needs `CAP_SYS_ADMIN` and AppArmor unconfined to mount overlayfs. This profile
@@ -228,11 +242,12 @@ managed resources whose host owner died in a hard crash.
 
 ## Deterministic integration check
 
-With the venv active and Docker reachable:
+From the paper-pi checkout, with Docker reachable:
 
 ```sh
-python -m unittest discover -s packages/evals/pier -p 'test_paper_job.py' -v
-PAPER_PIER_INTEGRATION=1 python -m unittest discover -s packages/evals/pier -p 'test_paper_agent*.py' -v
+export PATH="$PWD/../.tools/node-v24.21.0-linux-x64/bin:$PWD/.venv/bin:$PATH"
+.venv/bin/python -m unittest discover -s packages/evals/pier -p 'test_paper_*.py' -v
+PAPER_PIER_INTEGRATION=1 .venv/bin/python -m unittest discover -s packages/evals/pier -p 'test_paper_agent*.py' -v
 ```
 
 This builds a tiny fixture, drives real Pi tools using the faux provider, and expects reward 1
