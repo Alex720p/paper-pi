@@ -269,9 +269,9 @@ in.
 `driver.dispose()` unwinds the run and `session.dispose()` fires paper's `session_shutdown`, which
 tears down the VM and containers. Skip them and a qemu process outlives the test.
 
-### RQ2: per-tool-call latency benchmark
+### RQ3: per-tool-call latency benchmark
 
-`src/rq2-latency.ts` measures the latency the `paper` sandbox adds to each tool call, against the
+`src/rq3-latency.ts` measures the latency the `paper` sandbox adds to each tool call, against the
 same tools running unsandboxed. Both arms are driven through the fake-session interface, so an
 identical tool-call sequence runs with no model and no provider credentials, and the only difference
 between them is whether the extension is loaded.
@@ -281,7 +281,7 @@ CI — nothing boots a VM unless you ask it to:
 
 ```bash
 node_modules/.bin/tsx --tsconfig tsconfig.json \
-  packages/evals/src/rq2-latency.ts --trials 5 --reps 20 --warmup 3
+  packages/evals/src/rq3-latency.ts --trials 5 --reps 20 --warmup 3
 ```
 
 | flag | default | meaning |

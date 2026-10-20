@@ -1,8 +1,8 @@
 /**
- * RQ2: per-tool-call latency of the paper prototype against the original Pi Agent Harness.
+ * RQ3: per-tool-call latency of the paper prototype against the original Pi Agent Harness.
  *
  *   node_modules/.bin/tsx --tsconfig tsconfig.json \
- *     packages/evals/src/rq2-latency.ts --trials 5 --reps 20 --warmup 3
+ *     packages/evals/src/rq3-latency.ts --trials 5 --reps 20 --warmup 3
  *
  * Both arms are driven through the fake-session interface, so an identical tool-call sequence runs
  * with no model and no provider credentials. The only difference between them is whether the paper
@@ -97,7 +97,7 @@ function parseOptions(argv: string[]): Options {
 			options.tools = names as ToolName[];
 		} else if (arg === "--help" || arg === "-h") {
 			console.log(
-				"usage: rq2-latency.ts [--trials n] [--warmup n] [--reps n] [--tools a,b] [--fixture n] [--json path]",
+				"usage: rq3-latency.ts [--trials n] [--warmup n] [--reps n] [--tools a,b] [--fixture n] [--json path]",
 			);
 			process.exit(0);
 		} else throw new Error(`unknown argument: ${arg}`);
@@ -147,7 +147,7 @@ function argsFor(tool: ToolName, index: number): Record<string, unknown> {
 }
 
 async function createFixture(withPaper: boolean, editTargets: number[], sourceFiles: number): Promise<string> {
-	const root = await mkdtemp(join(tmpdir(), withPaper ? "rq2-proto-" : "rq2-orig-"));
+	const root = await mkdtemp(join(tmpdir(), withPaper ? "rq3-proto-" : "rq3-orig-"));
 	const cwd = join(root, "workspace");
 	await Promise.all([mkdir(cwd), mkdir(join(root, "agent"))]);
 	// src/ is the tree the read-only tools measure and is a fixed size; out/ and edits/ hold the
@@ -252,7 +252,7 @@ async function runTrial(withPaper: boolean, options: Options, label: string): Pr
 	const firstCall = new Map<ToolName, number>();
 
 	try {
-		await arm.driver.start("RQ2 latency workload.");
+		await arm.driver.start("RQ3 latency workload.");
 		// One tool at a time, in ALL_TOOLS order, so a group's samples are consecutive and no other
 		// tool's side effects land inside them.
 		for (const tool of ALL_TOOLS) {
@@ -323,7 +323,7 @@ async function main(): Promise<void> {
 
 	const lines: string[] = [];
 	lines.push("");
-	lines.push("RQ2 tool-call latency: paper prototype vs original Pi Agent Harness");
+	lines.push("RQ3 tool-call latency: paper prototype vs original Pi Agent Harness");
 	lines.push(
 		`config: trials=${options.trials} warmup=${options.warmup} reps=${options.reps} tools=${options.tools.join(",")}`,
 	);
