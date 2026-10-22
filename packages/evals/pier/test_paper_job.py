@@ -47,24 +47,30 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
             (trial / "verifier/reward.json").write_text('{"reward": 0}')
         return trial
 
-    def test_archive_preserves_graded_attempts_and_every_interrupted_artifact(self):
+    def test_archive_retries_only_confirmed_disconnects_and_preserves_other_failures(self):
         retained = [self.trial("completed"), self.trial("timeout", error="AgentTimeoutError"),
-                    self.trial("agent-error", error="NonZeroAgentExitCodeError")]
+                    self.trial("agent-error", error="NonZeroAgentExitCodeError"),
+                    self.trial("ungraded", reward=False), self.trial("infrastructure", error="RuntimeError"),
+                    self.trial("cancelled", error="CancelledError")]
         interrupted = [self.trial("disconnected", error="InferenceUnavailableError"),
-                       self.trial("incomplete", result=False), self.trial("ungraded", reward=False),
-                       self.trial("infrastructure", error="RuntimeError"),
                        self.trial("disconnect-cleanup", error="RuntimeError", metadata={"paper": {"inferenceUnavailable": True}})]
-        early = self.root / "early-start"
-        early.mkdir()
-        (early / "agent").mkdir()
         (self.root / "unrelated").mkdir()
         archived = archive_unfinished_trials(self.root)
-        self.assertEqual(len(archived), 6)
+        self.assertEqual(len(archived), 2)
         self.assertTrue(all(path.exists() for path in retained))
-        self.assertTrue(all(not path.exists() for path in interrupted + [early]))
-        self.assertEqual(sum((path / "agent/model.patch").exists() for path in archived), 5)
+        self.assertTrue(all(not path.exists() for path in interrupted))
+        self.assertEqual(sum((path / "agent/model.patch").exists() for path in archived), 2)
         self.assertTrue((self.root / "unrelated").exists())
         self.assertEqual(archive_unfinished_trials(self.root), [])
+
+    def test_missing_result_blocks_resume_before_archiving_any_attempt(self):
+        disconnected = self.trial("a-disconnected", error="InferenceUnavailableError")
+        unknown = self.trial("z-incomplete", result=False)
+        with self.assertRaisesRegex(ValueError, "no result proving an inference disconnection"):
+            archive_unfinished_trials(self.root)
+        self.assertTrue(disconnected.exists())
+        self.assertTrue(unknown.exists())
+        self.assertFalse((self.root / ".interrupted").exists())
 
     def test_malformed_result_prevents_partial_archiving(self):
         first = self.trial("a-incomplete", result=False)
@@ -94,11 +100,27 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads((archived[0] / "result.json").read_text())["verifier_result"]["rewards"]["reward"], 1)
         self.assertEqual(archive_unfinished_trials(self.root), [])
 
-    def test_infrastructure_metadata_is_retried_even_with_a_reward_and_no_exception(self):
+    def test_infrastructure_metadata_does_not_authorize_a_retry(self):
         trial = self.trial("infra", metadata={"paper": {"failureKind": "infrastructure", "submissionReady": False}})
         archived = archive_unfinished_trials(self.root)
-        self.assertFalse(trial.exists())
-        self.assertEqual(len(archived), 1)
+        self.assertTrue(trial.exists())
+        self.assertEqual(archived, [])
+
+    def test_archived_submission_failure_is_restored_instead_of_selecting_a_later_pass(self):
+        first = self.trial("submission-failed", error="RuntimeError", reward=False)
+        later = self.trial("later-pass")
+        for trial, started in ((first, "2026-10-12T09:00:00Z"), (later, "2026-10-12T10:00:00Z")):
+            result = json.loads((trial / "result.json").read_text())
+            result.update(task_name="same-task", trial_name=trial.name, started_at=started)
+            (trial / "result.json").write_text(json.dumps(result))
+        saved = (first / "result.json").read_bytes()
+        archive = self.root / ".interrupted"
+        archive.mkdir()
+        first.rename(archive / "submission-failed-12345678")
+        self.assertEqual(len(archive_unfinished_trials(self.root)), 1)
+        self.assertEqual((first / "result.json").read_bytes(), saved)
+        self.assertFalse(later.exists())
+        self.assertEqual(archive_unfinished_trials(self.root), [])
 
     def test_native_multiple_attempt_jobs_retain_all_graded_attempts(self):
         trials = [self.trial(name) for name in ("first", "second")]
@@ -106,7 +128,7 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
             result = json.loads((trial / "result.json").read_text())
             result["task_name"] = "same-task"
             (trial / "result.json").write_text(json.dumps(result))
-        self.assertEqual(archive_unfinished_trials(self.root, first_valid_only=False), [])
+        self.assertEqual(archive_unfinished_trials(self.root, first_attempt_only=False), [])
         self.assertTrue(all(trial.exists() for trial in trials))
 
     def test_lock_rejects_concurrent_resume_and_releases_after_error(self):
@@ -203,7 +225,7 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
         config.job_name = self.root.name
         (self.root / "config.json").write_text(config.model_dump_json())
         completed = self.trial("completed")
-        interrupted = self.trial("interrupted", result=False)
+        interrupted = self.trial("interrupted", error="InferenceUnavailableError")
         async def create(saved):
             self.assertEqual(saved, config)
             self.assertTrue(completed.exists())
@@ -214,7 +236,7 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
              patch("paper_job.run_job", AsyncMock(return_value=75)):
             self.assertEqual(await resume(self.root), 75)
         history = [json.loads(line) for line in (self.root / "resume-history.jsonl").read_text().splitlines()]
-        self.assertEqual(history[0]["selection_policy"], "first_valid_completed_grade")
+        self.assertEqual(history[0]["selection_policy"], "first_non_vpn_attempt")
         self.assertTrue(history[0]["source_sha256"])
 
     async def test_cli_freezes_selection_and_preserves_native_budgets(self):

@@ -1,4 +1,4 @@
-"""Preserve interrupted attempts and stop the queue when inference access disappears."""
+"""Retry confirmed inference disconnections and retain every other outcome."""
 
 import fcntl
 import json
@@ -54,6 +54,12 @@ def is_infrastructure_failure(result, trial_dir):
     )
 
 
+def is_inference_disconnect(result):
+    paper = ((result.get("agent_result") or {}).get("metadata") or {}).get("paper") or {}
+    error = result.get("exception_info") or {}
+    return paper.get("inferenceUnavailable") is True or error.get("exception_type") == "InferenceUnavailableError"
+
+
 def read_attempts(job_dir):
     attempts = []
     for path in [*job_dir.glob("*/result.json"), *job_dir.glob(".interrupted/*/result.json")]:
@@ -65,44 +71,52 @@ def read_attempts(job_dir):
         if started.tzinfo is None:
             started = started.replace(tzinfo=UTC)
         attempts.append({"path": path.parent, "result": result, "key": str(key),
-                         "started": started, "infrastructure_error": is_infrastructure_failure(result, path.parent)})
+                         "started": started, "infrastructure_error": is_infrastructure_failure(result, path.parent),
+                         "retryable": is_inference_disconnect(result)})
     return sorted(attempts, key=lambda attempt: (attempt["started"], str(attempt["path"])))
 
 
-def first_valid_attempts(attempts):
+def first_non_vpn_attempts(attempts):
     selected = {}
     for attempt in attempts:
-        if not attempt["infrastructure_error"]:
+        if not attempt["retryable"]:
             selected.setdefault(attempt["key"], attempt)
     return selected
 
 
-def archive_unfinished_trials(job_dir, *, first_valid_only=True):
+def archive_unfinished_trials(job_dir, *, first_attempt_only=True):
     # Classify every attempt before moving any, so malformed artifacts cannot
     # leave a partially archived job. Include result-less starts that lack config.
     attempts = read_attempts(job_dir)
     by_path = {attempt["path"]: attempt for attempt in attempts}
-    selected = first_valid_attempts(attempts)
+    selected = first_non_vpn_attempts(attempts)
     unfinished = []
-    for trial in sorted(job_dir.iterdir()):
-        if not trial.is_dir() or trial.name.startswith("."):
-            continue
+    trials = [path for path in job_dir.iterdir() if path.is_dir() and not path.name.startswith(".")]
+    archive = job_dir / ".interrupted"
+    if archive.is_dir():
+        trials.extend(path for path in archive.iterdir() if path.is_dir())
+    for trial in sorted(trials):
         if not any((trial / name).exists() for name in ("config.json", "result.json", "trial.log", "agent", "verifier", "artifacts")):
             continue
         attempt = by_path.get(trial)
-        if attempt is None or attempt["infrastructure_error"] or (first_valid_only and selected[attempt["key"]]["path"] != trial):
+        if attempt is None:
+            raise ValueError(f"Cannot resume: {trial} has no result proving an inference disconnection; "
+                             "VPN-only retry policy preserves this attempt for inspection")
+        if trial.parent != job_dir:
+            continue
+        if attempt["retryable"] or (first_attempt_only and selected[attempt["key"]]["path"] != trial):
             unfinished.append(trial)
     restorations = []
-    for attempt in selected.values() if first_valid_only else []:
+    for attempt in selected.values() if first_attempt_only else []:
         if attempt["path"].parent != job_dir / ".interrupted":
             continue
         result = attempt["result"]
         name = result.get("trial_name") or (result.get("config") or {}).get("trial_name")
         if not name or Path(name).name != name or name in (".", ".."):
-            raise ValueError(f"Archived graded attempt lacks a safe trial_name: {attempt['path']}")
+            raise ValueError(f"Archived non-VPN attempt lacks a safe trial_name: {attempt['path']}")
         target = job_dir / name
         if target.exists() and target not in unfinished:
-            raise ValueError(f"Cannot restore graded attempt over {target}")
+            raise ValueError(f"Cannot restore non-VPN attempt over {target}")
         restorations.append((attempt["path"], target))
     archived = []
     for trial in unfinished:

@@ -162,7 +162,7 @@ class PaperDeepSweTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["verified_trials"], 3)
         self.assertEqual(result["infrastructure_errors"], 3)
 
-    def test_summary_selects_first_valid_grade_across_archived_and_current_attempts(self):
+    def test_summary_selects_first_non_vpn_attempt_including_ungraded_infrastructure_failure(self):
         for name, task, reward, error, started in (
             (".interrupted/disconnected", "retry", 1, "InferenceUnavailableError", "2026-10-12T09:00:00Z"),
             ("completed", "retry", 0, None, "2026-10-12T10:00:00Z"),
@@ -170,6 +170,7 @@ class PaperDeepSweTests(unittest.IsolatedAsyncioTestCase):
             (".interrupted/first-zero", "zero", 0, None, "2026-10-12T09:00:00Z"),
             ("second-pass", "zero", 1, None, "2026-10-12T10:00:00Z"),
             (".interrupted/setup", "unresolved", None, "AbsoluteLinkError", "2026-10-12T09:00:00Z"),
+            ("repaired-pass", "unresolved", 1, None, "2026-10-12T10:00:00Z"),
         ):
             trial = self.root / name
             trial.mkdir(parents=True)
@@ -183,10 +184,13 @@ class PaperDeepSweTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected["retry"]["rewards"]["reward"], 0)
         self.assertEqual(selected["zero"]["rewards"]["reward"], 0)
         self.assertTrue(selected["unresolved"]["infrastructure_error"])
+        self.assertIsNone(selected["unresolved"]["rewards"])
+        self.assertFalse(selected["unresolved"]["retryable"])
+        self.assertEqual(summary["selection_policy"], "first_non_vpn_attempt")
         self.assertEqual(summary["verified_trials"], 2)
         self.assertEqual(summary["infrastructure_errors"], 1)
         self.assertEqual(summary["infrastructure_attempts"], 2)
-        self.assertEqual(len(summary["attempts"]), 6)
+        self.assertEqual(len(summary["attempts"]), 7)
 
     async def test_pause_prints_the_same_console_resume_interface(self):
         callbacks = []

@@ -21,7 +21,7 @@ from pier.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig
 
 from paper_config import Config, ModelConfig
 from paper_job import launch, resume, validate_tasks
-from paper_recovery import first_valid_attempts, read_attempts, trial_rewards
+from paper_recovery import first_non_vpn_attempts, read_attempts, trial_rewards
 
 PI_ROOT = Path(__file__).resolve().parents[3]
 DEEPSWE_COMMIT = "0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea"
@@ -144,6 +144,7 @@ def provenance(config, job):
         "pinned_deepswe_commit": DEEPSWE_COMMIT,
         "model": config.model.model_dump(mode="json"), "tasks": [p.path.name for p in job.tasks],
         "attempts": 1, "concurrency": 1, "whole_trial_retries": 0, "budgets": "task defaults",
+        "retry_policy": "confirmed_inference_disconnect_only", "selection_policy": "first_non_vpn_attempt",
         "prune_docker_cache": config.run.prune_docker_cache,
         "zone_profile": {"backend": "docker", "runtime": "runc", "submission": "staged source only"},
     }
@@ -152,25 +153,26 @@ def provenance(config, job):
 def summarize(job_dir):
     job_dir = job_dir.expanduser().resolve()
     attempts = read_attempts(job_dir)
-    selected = first_valid_attempts(attempts)
-    # For tasks still lacking a valid grade, report the latest infrastructure outcome.
+    selected = first_non_vpn_attempts(attempts)
+    # A task with only disconnected attempts remains pending; every non-VPN outcome is terminal.
     latest = {attempt["key"]: attempt for attempt in attempts}
     trials = []
     history = []
     for attempt in attempts:
         result = attempt["result"]
-        paper = ((result.get("agent_result") or {}).get("metadata") or {}).get("paper") or {}
         entry = {"task": result.get("task_name"), "rewards": trial_rewards(result, attempt["path"]),
                  "exception": result.get("exception_info"), "path": str(attempt["path"]),
                  "usage": result.get("agent_result"),
-                 "interrupted": paper.get("inferenceUnavailable", False),
+                 "interrupted": attempt["retryable"],
+                 "retryable": attempt["retryable"],
                  "infrastructure_error": attempt["infrastructure_error"]}
         chosen = selected.get(attempt["key"], latest[attempt["key"]])
         history.append({**entry, "selected": chosen is attempt})
         if chosen is attempt:
             trials.append(entry)
     return {"job_dir": str(job_dir), "trials": trials,
-            "selection_policy": "first_valid_completed_grade", "attempts": history,
+            "selection_policy": "first_non_vpn_attempt", "attempts": history,
+            "retryable_trials": sum(t["retryable"] for t in trials),
             "verified_trials": sum(not t["infrastructure_error"] for t in trials),
             "infrastructure_errors": sum(t["infrastructure_error"] for t in trials),
             "infrastructure_attempts": sum(t["infrastructure_error"] for t in history)}

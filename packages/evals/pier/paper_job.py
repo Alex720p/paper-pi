@@ -35,6 +35,8 @@ def validate_config(config):
         raise ValueError("prune_docker_cache must be a boolean")
     if config.n_concurrent_trials < 1 or config.n_attempts < 1:
         raise ValueError("Concurrency and attempts must be positive")
+    if config.retry.max_retries != 0:
+        raise ValueError("VPN-only retry policy requires max_retries=0")
     if pruning and (config.n_concurrent_trials != 1 or not config.environment.delete):
         raise ValueError("prune_docker_cache requires concurrency=1 and environment.delete=true")
     if pruning and config.environment.import_path != "paper_environment:PaperDockerEnvironment":
@@ -160,14 +162,14 @@ async def resume(job_dir):
                    *sorted((pi_root / "packages/coding-agent/examples/extensions/paper").glob("*.ts"))]
         revision = subprocess.run(["git", "-C", str(pi_root), "rev-parse", "HEAD"], capture_output=True, text=True)
         entry = {"started_at": datetime.now(UTC).isoformat(),
-                 "selection_policy": "first_valid_completed_grade" if saved.n_attempts == 1 else "native_multiple_attempts",
+                 "selection_policy": "first_non_vpn_attempt" if saved.n_attempts == 1 else "native_multiple_attempts_vpn_retries_only",
                  "commit": revision.stdout.strip() if revision.returncode == 0 else None,
                  "source_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}}
-        archived = archive_unfinished_trials(job_dir, first_valid_only=saved.n_attempts == 1)
+        archived = archive_unfinished_trials(job_dir, first_attempt_only=saved.n_attempts == 1)
         entry["archived_attempts"] = [str(path.relative_to(job_dir)) for path in archived]
         with (job_dir / "resume-history.jsonl").open("a") as history:
             history.write(json.dumps(entry, sort_keys=True) + "\n")
-        print(f"Resuming {job_dir}; archived {len(archived)} unfinished attempts.", flush=True)
+        print(f"Resuming {job_dir}; archived {len(archived)} disconnected or superseded attempts.", flush=True)
         job = await Job.create(saved)
         status = await run_job(job, prune=saved.environment.kwargs.get("prune_docker_cache", False))
     return exit_status(job_dir, status)
@@ -189,7 +191,7 @@ def parser():
     run.add_argument("--ak", dest="agent_kwarg", action="append", default=[])
     run.add_argument("--prune-docker-cache", action="store_true",
                      help="Remove unused trial image tags and builder-wide cache; requires concurrency=1")
-    restart = commands.add_parser("resume", help="Restart unfinished tasks using saved job settings")
+    restart = commands.add_parser("resume", help="Retry confirmed inference disconnections using saved job settings")
     restart.add_argument("job_dir", type=Path)
     return result
 

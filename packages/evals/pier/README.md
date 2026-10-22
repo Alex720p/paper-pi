@@ -80,23 +80,27 @@ staged work and logs, closes zones, pauses the queue, exits 75, and prints:
 ```
 
 Reconnect the VPN and restore the key before resuming. The saved selection, complete model
-settings, limits, and pruning policy are reused even if the original TOML changes. Resume
-restarts interrupted tasks from the beginning. Graded completed tasks, including zero scores,
-graded timeouts, and finalized agent failures, are skipped. Infrastructure/ungraded attempts
-are archived under `.interrupted/` before retrying, preserving their logs and patches.
-Manual interruption and process crashes use the same resume command.
+settings, limits, and pruning policy are reused even if the original TOML changes. Only confirmed
+inference disconnections restart from the beginning: an `InferenceUnavailableError` or trusted
+`paper.inferenceUnavailable: true` metadata must identify the attempt. These attempts are archived
+under `.interrupted/`, preserving their logs and patches. Other outcomes, including zero scores,
+timeouts, model errors, Git/submission failures, setup failures, and manual cancellations, are
+retained without retry. Tasks that have never started still run normally.
 
 Press Ctrl+C once in the launcher's terminal to stop the queue gracefully. The Node runner uses
 its own process session, so terminal signals do not race its sandbox cleanup hooks. The launcher
-requests finalization with SIGUSR1, waits for the runner, and records the cancelled trial for
-retry. A manual interruption is not a completed graded timeout. Let cleanup finish before resume.
+requests finalization with SIGUSR1, waits for the runner, and records the cancelled trial.
+A manual interruption does not authorize a fresh attempt. Let cleanup finish before resume.
 
-Summary and resume use the first valid completed grade per task, including reward 0, graded
-timeouts, and finalized agent errors. A VPN-interrupted or infrastructure-failed attempt remains
-retryable even if it has a raw verifier reward. Summary includes current and archived attempts,
-marks the selected result, and reports historical infrastructure attempts separately from tasks
-still lacking a valid grade. A later pass cannot replace an earlier valid reward 0. All original
-records are retained; resume can restore an archived first valid grade instead of rerunning it.
+Summary and resume select the first non-VPN attempt per task, including ungraded infrastructure
+failures. A later pass cannot replace it. Only a confirmed disconnection remains retryable even
+if it has a raw verifier reward. Summary includes current and archived attempts, marks the selected
+result and its `retryable` status, and reports infrastructure outcomes separately. Missing grades
+remain missing; the adapter does not invent a verifier reward. Resume restores an archived first
+non-VPN result when necessary. This stricter selection also applies when inspecting older jobs.
+If a started trial has no `result.json`, resume stops before moving any attempts because it cannot
+establish a disconnection; its artifacts are preserved for inspection. Resume fingerprints record
+the `first_non_vpn_attempt` selection policy.
 
 The host connectivity monitor probes the effective endpoint's `/models` route without
 generating tokens. Probes time out after 20 seconds, run 30 seconds apart while inference is
