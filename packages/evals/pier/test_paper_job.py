@@ -1,7 +1,9 @@
 """Recovery, pruning, and launcher policy without Docker or inference."""
 
 import asyncio
+from datetime import datetime
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -70,6 +72,80 @@ class PaperJobTests(unittest.IsolatedAsyncioTestCase):
             archive_unfinished_trials(self.root)
         self.assertTrue(disconnected.exists())
         self.assertTrue(unknown.exists())
+        self.assertFalse((self.root / ".interrupted").exists())
+
+    def queued_trial(self, name):
+        (self.root / "config.json").write_text('{"n_concurrent_trials": 1}')
+        trial = self.root / name
+        trial.mkdir()
+        config = trial / "config.json"
+        config.write_text("{}")
+        (trial / "trial.log").touch()
+        for directory in ("agent", "verifier", "artifacts"):
+            (trial / directory).mkdir()
+        modified = datetime.fromisoformat("2026-10-23T02:01:22+00:00").timestamp()
+        os.utime(config, (modified, modified))
+        return trial
+
+    def queued_disconnect(self):
+        trial = self.trial("disconnected", error="InferenceUnavailableError")
+        result = json.loads((trial / "result.json").read_text())
+        result["finished_at"] = "2026-10-23T02:01:19Z"
+        (trial / "result.json").write_text(json.dumps(result))
+        return trial
+
+    def test_resume_archives_empty_queue_record_after_confirmed_disconnect(self):
+        disconnected = self.queued_disconnect()
+        queued = self.queued_trial("queued")
+        failed = self.trial("submission-failure", error="RuntimeError", reward=False)
+        saved = (failed / "result.json").read_bytes()
+        archived = archive_unfinished_trials(self.root)
+        self.assertEqual(len(archived), 2)
+        self.assertFalse(disconnected.exists())
+        self.assertFalse(queued.exists())
+        self.assertEqual((failed / "result.json").read_bytes(), saved)
+        queued_archive = next(path for path in archived if path.name.startswith("queued-"))
+        self.assertFalse((queued_archive / "result.json").exists())
+        self.assertEqual((queued_archive / "config.json").read_text(), "{}")
+        self.assertEqual(archive_unfinished_trials(self.root), [])
+
+    def test_empty_queue_record_without_confirmed_disconnect_blocks_resume(self):
+        queued = self.queued_trial("queued")
+        with self.assertRaisesRegex(ValueError, "no result proving an inference disconnection"):
+            archive_unfinished_trials(self.root)
+        self.assertTrue(queued.exists())
+
+    def test_empty_queue_record_predating_disconnect_blocks_resume(self):
+        self.queued_disconnect()
+        queued = self.queued_trial("queued")
+        modified = datetime.fromisoformat("2026-10-23T02:01:18+00:00").timestamp()
+        os.utime(queued / "config.json", (modified, modified))
+        with self.assertRaisesRegex(ValueError, "no result proving an inference disconnection"):
+            archive_unfinished_trials(self.root)
+        self.assertFalse((self.root / ".interrupted").exists())
+
+    def test_queue_record_with_execution_evidence_blocks_resume(self):
+        self.queued_disconnect()
+        queued = self.queued_trial("queued")
+        (queued / "agent/runner-process.json").write_text('{"pid": 123}')
+        with self.assertRaisesRegex(ValueError, "no result proving an inference disconnection"):
+            archive_unfinished_trials(self.root)
+        self.assertFalse((self.root / ".interrupted").exists())
+
+    def test_queue_record_with_nonempty_log_blocks_resume(self):
+        self.queued_disconnect()
+        queued = self.queued_trial("queued")
+        (queued / "trial.log").write_text("Starting environment")
+        with self.assertRaisesRegex(ValueError, "no result proving an inference disconnection"):
+            archive_unfinished_trials(self.root)
+        self.assertFalse((self.root / ".interrupted").exists())
+
+    def test_empty_queue_record_in_parallel_job_blocks_resume(self):
+        self.queued_disconnect()
+        self.queued_trial("queued")
+        (self.root / "config.json").write_text('{"n_concurrent_trials": 2}')
+        with self.assertRaisesRegex(ValueError, "no result proving an inference disconnection"):
+            archive_unfinished_trials(self.root)
         self.assertFalse((self.root / ".interrupted").exists())
 
     def test_malformed_result_prevents_partial_archiving(self):

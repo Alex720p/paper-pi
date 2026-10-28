@@ -84,6 +84,35 @@ def first_non_vpn_attempts(attempts):
     return selected
 
 
+def is_unstarted_queue_record(trial, job_dir, attempts):
+    # Pier writes config.json before START hooks. When the disconnect guard
+    # rejects the next serial task, only this empty layout remains on disk.
+    config = trial / "config.json"
+    log = trial / "trial.log"
+    saved = job_dir / "config.json"
+    if trial.is_symlink() or not saved.is_file() or config.is_symlink() or not config.is_file():
+        return False
+    if log.is_symlink() or not log.is_file() or log.stat().st_size:
+        return False
+    if json.loads(saved.read_text()).get("n_concurrent_trials") != 1:
+        return False
+    for entry in trial.iterdir():
+        if entry.name in ("config.json", "trial.log"):
+            continue
+        if entry.name not in ("agent", "verifier", "artifacts") or entry.is_symlink() or not entry.is_dir() or any(entry.iterdir()):
+            return False
+    for attempt in attempts:
+        finished = attempt["result"].get("finished_at")
+        if not attempt["retryable"] or not finished:
+            continue
+        finished = datetime.fromisoformat(finished.replace("Z", "+00:00"))
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=UTC)
+        if config.stat().st_mtime >= finished.timestamp():
+            return True
+    return False
+
+
 def archive_unfinished_trials(job_dir, *, first_attempt_only=True):
     # Classify every attempt before moving any, so malformed artifacts cannot
     # leave a partially archived job. Include result-less starts that lack config.
@@ -100,6 +129,10 @@ def archive_unfinished_trials(job_dir, *, first_attempt_only=True):
             continue
         attempt = by_path.get(trial)
         if attempt is None:
+            if is_unstarted_queue_record(trial, job_dir, attempts):
+                if trial.parent == job_dir:
+                    unfinished.append(trial)
+                continue
             raise ValueError(f"Cannot resume: {trial} has no result proving an inference disconnection; "
                              "VPN-only retry policy preserves this attempt for inspection")
         if trial.parent != job_dir:

@@ -169,7 +169,7 @@ async def resume(job_dir):
         entry["archived_attempts"] = [str(path.relative_to(job_dir)) for path in archived]
         with (job_dir / "resume-history.jsonl").open("a") as history:
             history.write(json.dumps(entry, sort_keys=True) + "\n")
-        print(f"Resuming {job_dir}; archived {len(archived)} disconnected or superseded attempts.", flush=True)
+        print(f"Resuming {job_dir}; archived {len(archived)} disconnected, unstarted, or superseded records.", flush=True)
         job = await Job.create(saved)
         status = await run_job(job, prune=saved.environment.kwargs.get("prune_docker_cache", False))
     return exit_status(job_dir, status)

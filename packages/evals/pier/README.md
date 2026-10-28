@@ -102,6 +102,12 @@ If a started trial has no `result.json`, resume stops before moving any attempts
 establish a disconnection; its artifacts are preserved for inspection. Resume fingerprints record
 the `first_non_vpn_attempt` selection policy.
 
+Pier can create the next task's config and empty log before the disconnect guard stops it.
+Resume archives this unstarted queue record only for a serial job, when its config was written
+after a recorded inference disconnection finished and its agent/verifier/artifact directories
+contain no entries. No result or verifier reward is invented. Nonempty logs, execution artifacts,
+unknown files, and records predating the disconnection still block resume for inspection.
+
 The host connectivity monitor probes the effective endpoint's `/models` route without
 generating tokens. Probes time out after 20 seconds, run 30 seconds apart while inference is
 active, and require three consecutive failures; streamed activity resets the count.
